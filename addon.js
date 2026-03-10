@@ -6,7 +6,6 @@ const { decryptConfig } = require("./utils/crypto");
 const { withRetry } = require("./utils/apiRetry");
 const TMDB_API_BASE = "https://api.themoviedb.org/3";
 const TMDB_CACHE_DURATION = 7 * 24 * 60 * 60 * 1000;
-const TMDB_DISCOVER_CACHE_DURATION = 24 * 60 * 60 * 1000; // 24h for recent content
 const AI_CACHE_DURATION = 7 * 24 * 60 * 60 * 1000;
 const RPDB_CACHE_DURATION = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_RPDB_KEY = process.env.RPDB_API_KEY;
@@ -18,41 +17,10 @@ const TRAKT_RAW_DATA_CACHE_DURATION = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_TRAKT_CLIENT_ID = process.env.TRAKT_CLIENT_ID;
 const MAX_AI_RECOMMENDATIONS = 30;
 
-// Single model for ALL queries - qwen2.5:7b is fastest + best format compliance
+// Single model for ALL queries
 const DEFAULT_LLM_BASE_URL = process.env.LLM_BASE_URL || "http://localhost:11434/v1";
 const DEFAULT_LLM_MODEL = process.env.LLM_MODEL || "qwen2.5:7b";
 const DEFAULT_LLM_API_KEY = process.env.LLM_API_KEY || "ollama";
-
-// TMDB provider IDs for streaming services
-const TMDB_PROVIDER_IDS = {
-  netflix: 8,
-  amazon: 119,
-  "amazon prime": 119,
-  "prime video": 119,
-  hulu: 15,
-  disney: 337,
-  "disney+": 337,
-  "apple tv": 350,
-  "apple tv+": 350,
-  hbo: 384,
-  max: 1899,
-  peacock: 386,
-  paramount: 531,
-  "paramount+": 531,
-  amc: 526,
-  "amc+": 526,
-  showtime: 37,
-  starz: 43,
-};
-
-// Keywords that signal the user wants recent/current content
-const RECENCY_KEYWORDS = [
-  /\bnew\b/i, /\bnew(?:est)?\b/i, /\blatest\b/i, /\brecent\b/i,
-  /\bcurrent\b/i, /\b2024\b/, /\b2025\b/, /\b2026\b/,
-  /\bin theater(s)?\b/i, /\bnow playing\b/i, /\bjust released\b/i,
-  /\bthis year\b/i, /\bthis week\b/i, /\bthis month\b/i,
-  /\bcoming out\b/i, /\bnewly released\b/i,
-];
 
 let queryCounter = 0;
 
@@ -83,113 +51,6 @@ async function callLocalLLM(prompt, baseUrl, model, apiKey) {
   const text = response?.choices?.[0]?.message?.content?.trim();
   if (!text) throw new Error("Empty response from local LLM");
   return text;
-}
-
-/**
- * Detect if a query is asking for recent/current content
- */
-function isRecencyQuery(query) {
-  return RECENCY_KEYWORDS.some((pattern) => pattern.test(query));
-}
-
-/**
- * Detect which streaming provider (if any) the query mentions
- */
-function detectStreamingProvider(query) {
-  const q = query.toLowerCase();
-  for (const [name, id] of Object.entries(TMDB_PROVIDER_IDS)) {
-    if (q.includes(name)) return { name, id };
-  }
-  return null;
-}
-
-/**
- * Fetch recent content from TMDB Discover API.
- * Returns up to 20 recent titles as context for the LLM prompt.
- * This solves the training cutoff problem - TMDB always has live data.
- */
-async function fetchRecentTmdbContent(type, tmdbKey, options = {}) {
-  const { providerId, genreIds, language = "en-US", monthsBack = 12 } = options;
-  const searchType = type === "movie" ? "movie" : "tv";
-  const cacheKey = `recent_${searchType}_${providerId || "all"}_${genreIds || "all"}_${language}_${monthsBack}`;
-
-  if (tmdbDiscoverCache.has(cacheKey)) {
-    logger.debug("TMDB recent content cache hit", { cacheKey });
-    return tmdbDiscoverCache.get(cacheKey).data;
-  }
-
-  try {
-    // Calculate date range
-    const endDate = new Date();
-    const startDate = new Date();
-    startDate.setMonth(startDate.getMonth() - monthsBack);
-    const startDateStr = startDate.toISOString().split("T")[0];
-    const endDateStr = endDate.toISOString().split("T")[0];
-
-    const params = new URLSearchParams({
-      api_key: tmdbKey,
-      language: language,
-      sort_by: "popularity.desc",
-      include_adult: "false",
-      page: "1",
-    });
-
-    // Date filter differs between movie and TV
-    if (searchType === "movie") {
-      params.set("primary_release_date.gte", startDateStr);
-      params.set("primary_release_date.lte", endDateStr);
-    } else {
-      params.set("first_air_date.gte", startDateStr);
-      params.set("first_air_date.lte", endDateStr);
-    }
-
-    if (providerId) {
-      params.set("with_watch_providers", String(providerId));
-      params.set("watch_region", "US");
-    }
-
-    if (genreIds && genreIds.length > 0) {
-      params.set("with_genres", genreIds.join(","));
-    }
-
-    const discoverUrl = `${TMDB_API_BASE}/discover/${searchType}?${params.toString()}`;
-    logger.info("Fetching recent TMDB content", { url: discoverUrl.replace(tmdbKey, "***"), searchType, providerId, monthsBack });
-
-    const data = await withRetry(
-      async () => {
-        const res = await fetch(discoverUrl);
-        if (!res.ok) throw new Error(`TMDB Discover error: ${res.status}`);
-        return res.json();
-      },
-      { maxRetries: 3, initialDelay: 1000, maxDelay: 8000, operationName: "TMDB Discover API" }
-    );
-
-    const results = (data.results || []).slice(0, 20).map((item) => ({
-      title: item.title || item.name,
-      year: (item.release_date || item.first_air_date || "").substring(0, 4),
-      tmdb_id: item.id,
-      overview: (item.overview || "").slice(0, 150),
-      rating: item.vote_average,
-      popularity: item.popularity,
-    }));
-
-    tmdbDiscoverCache.set(cacheKey, { timestamp: Date.now(), data: results });
-    logger.info("TMDB recent content fetched", { count: results.length, searchType, providerId });
-    return results;
-  } catch (error) {
-    logger.error("TMDB Discover fetch error", { error: error.message });
-    return [];
-  }
-}
-
-/**
- * Map genre name strings to TMDB genre IDs for use in Discover API
- */
-function genreNamesToTmdbIds(genreNames, type) {
-  const movieGenreMap = { action: 28, adventure: 12, animation: 16, comedy: 35, crime: 80, documentary: 99, drama: 18, family: 10751, fantasy: 14, history: 36, horror: 27, music: 10402, mystery: 9648, romance: 10749, scifi: 878, "science fiction": 878, thriller: 53, war: 10752, western: 37 };
-  const tvGenreMap = { action: 10759, adventure: 10759, animation: 16, comedy: 35, crime: 80, documentary: 99, drama: 18, family: 10751, fantasy: 10765, kids: 10762, mystery: 9648, news: 10763, reality: 10764, scifi: 10765, "science fiction": 10765, thriller: 9648, war: 10768, western: 37 };
-  const map = type === "movie" ? movieGenreMap : tvGenreMap;
-  return genreNames.map((g) => map[g.toLowerCase()]).filter(Boolean);
 }
 
 class SimpleLRUCache {
@@ -249,7 +110,6 @@ const fanartCache = new SimpleLRUCache({ max: 5000, ttl: RPDB_CACHE_DURATION });
 const similarContentCache = new SimpleLRUCache({ max: 5000, ttl: AI_CACHE_DURATION });
 const traktRawDataCache = new SimpleLRUCache({ max: 1000, ttl: TRAKT_RAW_DATA_CACHE_DURATION });
 const traktCache = new SimpleLRUCache({ max: 1000, ttl: TRAKT_CACHE_DURATION });
-const tmdbDiscoverCache = new SimpleLRUCache({ max: 1000, ttl: TMDB_DISCOVER_CACHE_DURATION });
 const queryAnalysisCache = new SimpleLRUCache({ max: 1000, ttl: AI_CACHE_DURATION });
 
 const HOST = process.env.HOST ? `https://${process.env.HOST}` : "https://stremio.itcon.au";
@@ -260,7 +120,6 @@ setInterval(() => {
   logger.info("Cache statistics", {
     tmdbCache: { size: tmdbCache.size, maxSize: tmdbCache.max },
     tmdbDetailsCache: { size: tmdbDetailsCache.size, maxSize: tmdbDetailsCache.max },
-    tmdbDiscoverCache: { size: tmdbDiscoverCache.size, maxSize: tmdbDiscoverCache.max },
     aiCache: { size: aiRecommendationsCache.size, maxSize: aiRecommendationsCache.max },
     rpdbCache: { size: rpdbCache.size, maxSize: rpdbCache.max },
   });
@@ -457,9 +316,9 @@ async function searchTMDBExactMatch(title, type, tmdbKey, language = "en-US", in
 
 const manifest = {
   id: "au.itcon.aisearch",
-  version: "1.0.66-local-llm",
+  version: "1.0.67-local-llm",
   name: "AI Search (Local LLM)",
-  description: "AI-powered movie and series recommendations using your local LLM, with live TMDB data for current releases",
+  description: "AI-powered movie and series recommendations using your local LLM",
   resources: ["catalog", "meta", { name: "stream", types: ["movie", "series"], idPrefixes: ["tt"] }],
   types: ["movie", "series"],
   catalogs: [
@@ -620,9 +479,6 @@ const TMDB_TV_GENRES = { 10759: "Action & Adventure", 16: "Animation", 35: "Come
 
 function clearTmdbCache() { const s = tmdbCache.size; tmdbCache.clear(); return { cleared: true, previousSize: s }; }
 function clearTmdbDetailsCache() { const s = tmdbDetailsCache.size; tmdbDetailsCache.clear(); return { cleared: true, previousSize: s }; }
-function clearTmdbDiscoverCache() { const s = tmdbDiscoverCache.size; tmdbDiscoverCache.clear(); return { cleared: true, previousSize: s }; }
-function removeTmdbDiscoverCacheItem(cacheKey) { if (!cacheKey) return { success: false, message: "No cache key" }; if (!tmdbDiscoverCache.has(cacheKey)) return { success: false, message: "Key not found", key: cacheKey }; tmdbDiscoverCache.delete(cacheKey); return { success: true, key: cacheKey }; }
-function listTmdbDiscoverCacheKeys() { return { success: true, count: tmdbDiscoverCache.size, keys: Array.from(tmdbDiscoverCache.cache.keys()) }; }
 function clearAiCache() { const s = aiRecommendationsCache.size; aiRecommendationsCache.clear(); return { cleared: true, previousSize: s }; }
 function removeAiCacheByKeywords(keywords) {
   if (!keywords || typeof keywords !== "string") throw new Error("Invalid keywords");
@@ -641,7 +497,6 @@ function getCacheStats() {
   return {
     tmdbCache: { size: tmdbCache.size, maxSize: tmdbCache.max, usagePercentage: ((tmdbCache.size / tmdbCache.max) * 100).toFixed(2) + "%" },
     tmdbDetailsCache: { size: tmdbDetailsCache.size, maxSize: tmdbDetailsCache.max, usagePercentage: ((tmdbDetailsCache.size / tmdbDetailsCache.max) * 100).toFixed(2) + "%" },
-    tmdbDiscoverCache: { size: tmdbDiscoverCache.size, maxSize: tmdbDiscoverCache.max, usagePercentage: ((tmdbDiscoverCache.size / tmdbDiscoverCache.max) * 100).toFixed(2) + "%" },
     aiCache: { size: aiRecommendationsCache.size, maxSize: aiRecommendationsCache.max, usagePercentage: ((aiRecommendationsCache.size / aiRecommendationsCache.max) * 100).toFixed(2) + "%" },
     rpdbCache: { size: rpdbCache.size, maxSize: rpdbCache.max, usagePercentage: ((rpdbCache.size / rpdbCache.max) * 100).toFixed(2) + "%" },
     fanartCache: { size: fanartCache.size, maxSize: fanartCache.max, usagePercentage: ((fanartCache.size / fanartCache.max) * 100).toFixed(2) + "%" },
@@ -653,14 +508,13 @@ function getCacheStats() {
 }
 
 function serializeAllCaches() {
-  return { tmdbCache: tmdbCache.serialize(), tmdbDetailsCache: tmdbDetailsCache.serialize(), tmdbDiscoverCache: tmdbDiscoverCache.serialize(), aiRecommendationsCache: aiRecommendationsCache.serialize(), rpdbCache: rpdbCache.serialize(), fanartCache: fanartCache.serialize(), traktCache: traktCache.serialize(), traktRawDataCache: traktRawDataCache.serialize(), queryAnalysisCache: queryAnalysisCache.serialize(), similarContentCache: similarContentCache.serialize(), stats: { queryCounter } };
+  return { tmdbCache: tmdbCache.serialize(), tmdbDetailsCache: tmdbDetailsCache.serialize(), aiRecommendationsCache: aiRecommendationsCache.serialize(), rpdbCache: rpdbCache.serialize(), fanartCache: fanartCache.serialize(), traktCache: traktCache.serialize(), traktRawDataCache: traktRawDataCache.serialize(), queryAnalysisCache: queryAnalysisCache.serialize(), similarContentCache: similarContentCache.serialize(), stats: { queryCounter } };
 }
 
 function deserializeAllCaches(data) {
   const results = {};
   if (data.tmdbCache) results.tmdbCache = tmdbCache.deserialize(data.tmdbCache);
   if (data.tmdbDetailsCache) results.tmdbDetailsCache = tmdbDetailsCache.deserialize(data.tmdbDetailsCache);
-  if (data.tmdbDiscoverCache) results.tmdbDiscoverCache = tmdbDiscoverCache.deserialize(data.tmdbDiscoverCache);
   if (data.aiRecommendationsCache) results.aiRecommendationsCache = aiRecommendationsCache.deserialize(data.aiRecommendationsCache);
   else if (data.aiCache) results.aiRecommendationsCache = aiRecommendationsCache.deserialize(data.aiCache);
   if (data.rpdbCache) results.rpdbCache = rpdbCache.deserialize(data.rpdbCache);
@@ -769,25 +623,7 @@ const catalogHandler = async function (args, req) {
     const intent = determineIntentFromKeywords(searchQuery);
     if (intent !== "ambiguous" && intent !== type) return { metas: [] };
 
-    // --- TMDB Discover injection for recency queries ---
-    let recentTmdbContent = [];
-    const recencyQuery = isRecencyQuery(searchQuery);
-    const streamingProvider = detectStreamingProvider(searchQuery);
     const genreCriteria = extractGenreCriteria(searchQuery);
-
-    if (recencyQuery || streamingProvider) {
-      logger.info("Recency/provider query detected — fetching live TMDB data", { searchQuery, provider: streamingProvider?.name, recency: recencyQuery });
-      const genreIds = genreCriteria?.include?.length > 0 ? genreNamesToTmdbIds(genreCriteria.include, type) : [];
-      // For "new" or "this year" queries look back 3 months, otherwise 12 months
-      const monthsBack = /\bnew\b|\bthis week\b|\bthis month\b|\bnow playing\b/i.test(searchQuery) ? 3 : 12;
-      recentTmdbContent = await fetchRecentTmdbContent(type, tmdbKey, {
-        providerId: streamingProvider?.id,
-        genreIds,
-        language,
-        monthsBack,
-      });
-      logger.info("TMDB Discover injection ready", { count: recentTmdbContent.length, type });
-    }
 
     let exactMatchMeta = null;
     let tmdbInitialResults = [];
@@ -828,8 +664,7 @@ const catalogHandler = async function (args, req) {
     }
 
     const cacheKey = `${searchQuery}_${type}_${traktData ? "trakt" : "no_trakt"}`;
-    // Skip cache for recency queries - they need live data every time
-    if (enableAiCache && !traktData && !isHomepageQuery && !recencyQuery && !streamingProvider && aiRecommendationsCache.has(cacheKey)) {
+    if (enableAiCache && !traktData && !isHomepageQuery && aiRecommendationsCache.has(cacheKey)) {
       const cached = aiRecommendationsCache.get(cacheKey);
       if (cached.configNumResults && numResults > cached.configNumResults) { aiRecommendationsCache.delete(cacheKey); }
       else if (!cached.data?.recommendations || (type === "movie" && !cached.data.recommendations.movies) || (type === "series" && !cached.data.recommendations.series)) { aiRecommendationsCache.delete(cacheKey); }
@@ -855,23 +690,6 @@ const catalogHandler = async function (args, req) {
       if (genreCriteria?.mood?.length > 0) promptLines.push(`Mood/Style: ${genreCriteria.mood.join(", ")}`);
       promptLines.push("");
 
-      // Inject live TMDB Discover data if available
-      if (recentTmdbContent.length > 0) {
-        const providerNote = streamingProvider ? ` on ${streamingProvider.name}` : "";
-        const recentTitles = recentTmdbContent.map(item =>
-          `- ${item.title} (${item.year})${item.rating > 0 ? ` [TMDB: ${item.rating.toFixed(1)}]` : ""}${item.overview ? ` — ${item.overview}` : ""}`
-        ).join("\n");
-        promptLines.push(
-          `LIVE DATA FROM TMDB (current releases${providerNote} — these ARE real, recently released titles):`,
-          "IMPORTANT: Prioritize these titles in your response. They are verified current content the LLM may not know about.",
-          "",
-          recentTitles,
-          "",
-          "Use the above as your PRIMARY source. You may add other highly relevant titles from your training data to fill remaining slots.",
-          ""
-        );
-      }
-
       if (traktData && isRecommendation) {
         const { preferences } = traktData;
         const { recentlyWatched, highlyRated, lowRated } = filteredTraktData || { recentlyWatched: traktData.watched?.slice(0, 100) || [], highlyRated: (traktData.rated || []).filter((i) => i.rating >= 4).slice(0, 25), lowRated: (traktData.rated || []).filter((i) => i.rating <= 2).slice(0, 25) };
@@ -882,7 +700,7 @@ const catalogHandler = async function (args, req) {
         promptLines.push("Top genres:", preferences.genres.map((g) => `- ${g.genre}`).join("\n"), "", "Favorite actors:", preferences.actors.map((a) => `- ${a.actor}`).join("\n"), "");
       }
 
-      if (tmdbInitialResults.length > 0 && recentTmdbContent.length === 0) {
+      if (tmdbInitialResults.length > 0) {
         const initialTitles = tmdbInitialResults.slice(0, 15).map(item => `- ${item.title || item.name} (${(item.release_date || item.first_air_date || 'N/A').substring(0, 4)})`).join('\n');
         promptLines.push("CONTEXT FROM DATABASE SEARCH:", "Use as primary data, add similar titles, sort by relevance:", "", initialTitles, "");
       }
@@ -923,7 +741,7 @@ const catalogHandler = async function (args, req) {
       }
 
       const promptText = promptLines.join("\n");
-      logger.info("Calling local LLM", { model: llmModel, baseUrl: llmBaseUrl, query: searchQuery, type, hasRecentContent: recentTmdbContent.length > 0 });
+      logger.info("Calling local LLM", { model: llmModel, baseUrl: llmBaseUrl, query: searchQuery, type });
 
       const text = await callLocalLLM(promptText, llmBaseUrl, llmModel, llmApiKey);
       const lines = text.split("\n").map((l) => l.trim()).filter((l) => l && !l.startsWith("type|"));
@@ -959,7 +777,7 @@ const catalogHandler = async function (args, req) {
 
       const hasMovies = finalResult.recommendations.movies && finalResult.recommendations.movies.length > 0;
       const hasSeries = finalResult.recommendations.series && finalResult.recommendations.series.length > 0;
-      if ((hasMovies || hasSeries) && !traktData && !isHomepageQuery && !recencyQuery && !streamingProvider && enableAiCache) {
+      if ((hasMovies || hasSeries) && !traktData && !isHomepageQuery && enableAiCache) {
         aiRecommendationsCache.set(cacheKey, { timestamp: Date.now(), data: finalResult, configNumResults: numResults });
       }
 
@@ -1067,14 +885,12 @@ const addonInterface = builder.getInterface();
 
 module.exports = {
   builder, addonInterface, catalogHandler, streamHandler, metaHandler,
-  clearTmdbCache, clearTmdbDetailsCache, clearTmdbDiscoverCache,
+  clearTmdbCache, clearTmdbDetailsCache,
   clearAiCache, removeAiCacheByKeywords, purgeEmptyAiCacheEntries,
   clearRpdbCache, clearFanartCache, clearTraktCache, clearTraktRawDataCache,
   clearQueryAnalysisCache, clearSimilarContentCache,
   getCacheStats, serializeAllCaches, deserializeAllCaches,
   discoverTypeAndGenres, filterTraktDataByGenres,
   incrementQueryCounter, getQueryCount, setQueryCount,
-  removeTmdbDiscoverCacheItem, listTmdbDiscoverCacheKeys,
   getRpdbTierFromApiKey, searchTMDBExactMatch, determineIntentFromKeywords,
-  fetchRecentTmdbContent, isRecencyQuery, detectStreamingProvider,
 };
