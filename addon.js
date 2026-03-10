@@ -6,7 +6,7 @@ const { decryptConfig } = require("./utils/crypto");
 const { withRetry } = require("./utils/apiRetry");
 const TMDB_API_BASE = "https://api.themoviedb.org/3";
 const TMDB_CACHE_DURATION = 7 * 24 * 60 * 60 * 1000;
-const TMDB_DISCOVER_CACHE_DURATION = 7 * 24 * 60 * 60 * 1000;
+const TMDB_DISCOVER_CACHE_DURATION = 24 * 60 * 60 * 1000; // 24h for recent content
 const AI_CACHE_DURATION = 7 * 24 * 60 * 60 * 1000;
 const RPDB_CACHE_DURATION = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_RPDB_KEY = process.env.RPDB_API_KEY;
@@ -18,20 +18,47 @@ const TRAKT_RAW_DATA_CACHE_DURATION = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_TRAKT_CLIENT_ID = process.env.TRAKT_CLIENT_ID;
 const MAX_AI_RECOMMENDATIONS = 30;
 
-// Default local LLM settings (can be overridden per-user in config)
+// Single model for ALL queries - qwen2.5:7b is fastest + best format compliance
 const DEFAULT_LLM_BASE_URL = process.env.LLM_BASE_URL || "http://localhost:11434/v1";
-const DEFAULT_LLM_MODEL = process.env.LLM_MODEL || "llama3.2";
+const DEFAULT_LLM_MODEL = process.env.LLM_MODEL || "qwen2.5:7b";
 const DEFAULT_LLM_API_KEY = process.env.LLM_API_KEY || "ollama";
+
+// TMDB provider IDs for streaming services
+const TMDB_PROVIDER_IDS = {
+  netflix: 8,
+  amazon: 119,
+  "amazon prime": 119,
+  "prime video": 119,
+  hulu: 15,
+  disney: 337,
+  "disney+": 337,
+  "apple tv": 350,
+  "apple tv+": 350,
+  hbo: 384,
+  max: 1899,
+  peacock: 386,
+  paramount: 531,
+  "paramount+": 531,
+  amc: 526,
+  "amc+": 526,
+  showtime: 37,
+  starz: 43,
+};
+
+// Keywords that signal the user wants recent/current content
+const RECENCY_KEYWORDS = [
+  /\bnew\b/i, /\bnew(?:est)?\b/i, /\blatest\b/i, /\brecent\b/i,
+  /\bcurrent\b/i, /\b2024\b/, /\b2025\b/, /\b2026\b/,
+  /\bin theater(s)?\b/i, /\bnow playing\b/i, /\bjust released\b/i,
+  /\bthis year\b/i, /\bthis week\b/i, /\bthis month\b/i,
+  /\bcoming out\b/i, /\bnewly released\b/i,
+];
 
 let queryCounter = 0;
 
 /**
- * OpenAI-compatible LLM call — works with Ollama, LM Studio, vLLM, etc.
- * @param {string} prompt - The prompt text
- * @param {string} baseUrl - Base URL of the OpenAI-compatible endpoint
- * @param {string} model - Model name to use
- * @param {string} apiKey - API key (can be any string for Ollama)
- * @returns {Promise<string>} - The model's response text
+ * OpenAI-compatible LLM call - works with Ollama, LM Studio, vLLM, etc.
+ * Uses a single configured model for ALL query types.
  */
 async function callLocalLLM(prompt, baseUrl, model, apiKey) {
   const url = `${baseUrl.replace(/\/$/, "")}/chat/completions`;
@@ -41,36 +68,128 @@ async function callLocalLLM(prompt, baseUrl, model, apiKey) {
     temperature: 0.7,
     stream: false,
   };
-
   const response = await withRetry(
     async () => {
       const res = await fetch(url, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`,
-        },
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
         body: JSON.stringify(body),
       });
-      if (!res.ok) {
-        const err = new Error(`LLM API error: ${res.status}`);
-        err.status = res.status;
-        throw err;
-      }
+      if (!res.ok) { const err = new Error(`LLM API error: ${res.status}`); err.status = res.status; throw err; }
       return res.json();
     },
-    {
-      maxRetries: 3,
-      initialDelay: 2000,
-      maxDelay: 10000,
-      shouldRetry: (error) => !error.status || error.status >= 500,
-      operationName: "Local LLM API call",
-    }
+    { maxRetries: 3, initialDelay: 2000, maxDelay: 10000, shouldRetry: (error) => !error.status || error.status >= 500, operationName: "Local LLM API call" }
   );
-
   const text = response?.choices?.[0]?.message?.content?.trim();
   if (!text) throw new Error("Empty response from local LLM");
   return text;
+}
+
+/**
+ * Detect if a query is asking for recent/current content
+ */
+function isRecencyQuery(query) {
+  return RECENCY_KEYWORDS.some((pattern) => pattern.test(query));
+}
+
+/**
+ * Detect which streaming provider (if any) the query mentions
+ */
+function detectStreamingProvider(query) {
+  const q = query.toLowerCase();
+  for (const [name, id] of Object.entries(TMDB_PROVIDER_IDS)) {
+    if (q.includes(name)) return { name, id };
+  }
+  return null;
+}
+
+/**
+ * Fetch recent content from TMDB Discover API.
+ * Returns up to 20 recent titles as context for the LLM prompt.
+ * This solves the training cutoff problem - TMDB always has live data.
+ */
+async function fetchRecentTmdbContent(type, tmdbKey, options = {}) {
+  const { providerId, genreIds, language = "en-US", monthsBack = 12 } = options;
+  const searchType = type === "movie" ? "movie" : "tv";
+  const cacheKey = `recent_${searchType}_${providerId || "all"}_${genreIds || "all"}_${language}_${monthsBack}`;
+
+  if (tmdbDiscoverCache.has(cacheKey)) {
+    logger.debug("TMDB recent content cache hit", { cacheKey });
+    return tmdbDiscoverCache.get(cacheKey).data;
+  }
+
+  try {
+    // Calculate date range
+    const endDate = new Date();
+    const startDate = new Date();
+    startDate.setMonth(startDate.getMonth() - monthsBack);
+    const startDateStr = startDate.toISOString().split("T")[0];
+    const endDateStr = endDate.toISOString().split("T")[0];
+
+    const params = new URLSearchParams({
+      api_key: tmdbKey,
+      language: language,
+      sort_by: "popularity.desc",
+      include_adult: "false",
+      page: "1",
+    });
+
+    // Date filter differs between movie and TV
+    if (searchType === "movie") {
+      params.set("primary_release_date.gte", startDateStr);
+      params.set("primary_release_date.lte", endDateStr);
+    } else {
+      params.set("first_air_date.gte", startDateStr);
+      params.set("first_air_date.lte", endDateStr);
+    }
+
+    if (providerId) {
+      params.set("with_watch_providers", String(providerId));
+      params.set("watch_region", "US");
+    }
+
+    if (genreIds && genreIds.length > 0) {
+      params.set("with_genres", genreIds.join(","));
+    }
+
+    const discoverUrl = `${TMDB_API_BASE}/discover/${searchType}?${params.toString()}`;
+    logger.info("Fetching recent TMDB content", { url: discoverUrl.replace(tmdbKey, "***"), searchType, providerId, monthsBack });
+
+    const data = await withRetry(
+      async () => {
+        const res = await fetch(discoverUrl);
+        if (!res.ok) throw new Error(`TMDB Discover error: ${res.status}`);
+        return res.json();
+      },
+      { maxRetries: 3, initialDelay: 1000, maxDelay: 8000, operationName: "TMDB Discover API" }
+    );
+
+    const results = (data.results || []).slice(0, 20).map((item) => ({
+      title: item.title || item.name,
+      year: (item.release_date || item.first_air_date || "").substring(0, 4),
+      tmdb_id: item.id,
+      overview: (item.overview || "").slice(0, 150),
+      rating: item.vote_average,
+      popularity: item.popularity,
+    }));
+
+    tmdbDiscoverCache.set(cacheKey, { timestamp: Date.now(), data: results });
+    logger.info("TMDB recent content fetched", { count: results.length, searchType, providerId });
+    return results;
+  } catch (error) {
+    logger.error("TMDB Discover fetch error", { error: error.message });
+    return [];
+  }
+}
+
+/**
+ * Map genre name strings to TMDB genre IDs for use in Discover API
+ */
+function genreNamesToTmdbIds(genreNames, type) {
+  const movieGenreMap = { action: 28, adventure: 12, animation: 16, comedy: 35, crime: 80, documentary: 99, drama: 18, family: 10751, fantasy: 14, history: 36, horror: 27, music: 10402, mystery: 9648, romance: 10749, scifi: 878, "science fiction": 878, thriller: 53, war: 10752, western: 37 };
+  const tvGenreMap = { action: 10759, adventure: 10759, animation: 16, comedy: 35, crime: 80, documentary: 99, drama: 18, family: 10751, fantasy: 10765, kids: 10762, mystery: 9648, news: 10763, reality: 10764, scifi: 10765, "science fiction": 10765, thriller: 9648, war: 10768, western: 37 };
+  const map = type === "movie" ? movieGenreMap : tvGenreMap;
+  return genreNames.map((g) => map[g.toLowerCase()]).filter(Boolean);
 }
 
 class SimpleLRUCache {
@@ -81,79 +200,41 @@ class SimpleLRUCache {
     this.timestamps = new Map();
     this.expirations = new Map();
   }
-
   set(key, value) {
-    if (this.cache.size >= this.max) {
-      const oldestKey = this.timestamps.keys().next().value;
-      this.delete(oldestKey);
-    }
+    if (this.cache.size >= this.max) { const oldestKey = this.timestamps.keys().next().value; this.delete(oldestKey); }
     this.cache.set(key, value);
     this.timestamps.set(key, Date.now());
-    if (this.ttl !== Infinity) {
-      const expiration = Date.now() + this.ttl;
-      this.expirations.set(key, expiration);
-    }
+    if (this.ttl !== Infinity) { this.expirations.set(key, Date.now() + this.ttl); }
     return this;
   }
-
   get(key) {
     if (!this.cache.has(key)) return undefined;
     const expiration = this.expirations.get(key);
-    if (expiration && Date.now() > expiration) {
-      this.delete(key);
-      return undefined;
-    }
-    this.timestamps.delete(key);
-    this.timestamps.set(key, Date.now());
+    if (expiration && Date.now() > expiration) { this.delete(key); return undefined; }
+    this.timestamps.delete(key); this.timestamps.set(key, Date.now());
     return this.cache.get(key);
   }
-
   has(key) {
     if (!this.cache.has(key)) return false;
     const expiration = this.expirations.get(key);
-    if (expiration && Date.now() > expiration) {
-      this.delete(key);
-      return false;
-    }
+    if (expiration && Date.now() > expiration) { this.delete(key); return false; }
     return true;
   }
-
-  delete(key) {
-    this.cache.delete(key);
-    this.timestamps.delete(key);
-    this.expirations.delete(key);
-    return true;
-  }
-
-  clear() {
-    this.cache.clear();
-    this.timestamps.clear();
-    this.expirations.clear();
-    return true;
-  }
-
+  delete(key) { this.cache.delete(key); this.timestamps.delete(key); this.expirations.delete(key); return true; }
+  clear() { this.cache.clear(); this.timestamps.clear(); this.expirations.clear(); return true; }
   get size() { return this.cache.size; }
   keys() { return Array.from(this.cache.keys()); }
-
   serialize() {
     const entries = [];
-    for (const [key, value] of this.cache.entries()) {
-      const timestamp = this.timestamps.get(key);
-      const expiration = this.expirations.get(key);
-      entries.push({ key, value, timestamp, expiration });
-    }
+    for (const [key, value] of this.cache.entries()) { entries.push({ key, value, timestamp: this.timestamps.get(key), expiration: this.expirations.get(key) }); }
     return { max: this.max, ttl: this.ttl, entries };
   }
-
   deserialize(data) {
     if (!data || !data.entries) return false;
-    this.max = data.max || this.max;
-    this.ttl = data.ttl || this.ttl;
-    this.clear();
+    this.max = data.max || this.max; this.ttl = data.ttl || this.ttl; this.clear();
     for (const entry of data.entries) {
       if (entry.expiration && Date.now() > entry.expiration) continue;
-      this.cache.set(entry.key, entry.value);
-      this.timestamps.set(entry.key, entry.timestamp);
+      this.cache.set(entry.key, entry.value); this.timestamps.set(entry.key, entry.timestamp);
       if (entry.expiration) this.expirations.set(entry.key, entry.expiration);
     }
     return true;
@@ -194,29 +275,17 @@ function purgeEmptyAiCacheEntries() {
     const recommendations = cachedItem?.data?.recommendations;
     const hasMovies = recommendations?.movies?.length > 0;
     const hasSeries = recommendations?.series?.length > 0;
-    if (!hasMovies && !hasSeries) {
-      aiRecommendationsCache.delete(key);
-      purgedCount++;
-    }
+    if (!hasMovies && !hasSeries) { aiRecommendationsCache.delete(key); purgedCount++; }
   }
   return { scanned: totalScanned, purged: purgedCount, remaining: aiRecommendationsCache.size };
 }
 
 function mergeAndDeduplicate(newItems, existingItems) {
   const existingMap = new Map();
-  existingItems.forEach((item) => {
-    const media = item.movie || item.show;
-    const id = item.id || media?.ids?.trakt;
-    if (id) existingMap.set(id, item);
-  });
+  existingItems.forEach((item) => { const media = item.movie || item.show; const id = item.id || media?.ids?.trakt; if (id) existingMap.set(id, item); });
   newItems.forEach((item) => {
-    const media = item.movie || item.show;
-    const id = item.id || media?.ids?.trakt;
-    if (id) {
-      if (!existingMap.has(id) || (item.last_activity && existingMap.get(id).last_activity && new Date(item.last_activity) > new Date(existingMap.get(id).last_activity))) {
-        existingMap.set(id, item);
-      }
-    }
+    const media = item.movie || item.show; const id = item.id || media?.ids?.trakt;
+    if (id) { if (!existingMap.has(id) || (item.last_activity && existingMap.get(id).last_activity && new Date(item.last_activity) > new Date(existingMap.get(id).last_activity))) existingMap.set(id, item); }
   });
   return Array.from(existingMap.values());
 }
@@ -227,21 +296,18 @@ function processGenres(watchedItems, ratedItems) {
   ratedItems?.forEach((item) => { const media = item.movie || item.show; const weight = item.rating / 5; media.genres?.forEach((genre) => { genres.set(genre, (genres.get(genre) || 0) + weight); }); });
   return Array.from(genres.entries()).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([genre, count]) => ({ genre, count }));
 }
-
 function processActors(watchedItems, ratedItems) {
   const actors = new Map();
   watchedItems?.forEach((item) => { const media = item.movie || item.show; media.cast?.forEach((actor) => { actors.set(actor.name, (actors.get(actor.name) || 0) + 1); }); });
   ratedItems?.forEach((item) => { const media = item.movie || item.show; const weight = item.rating / 5; media.cast?.forEach((actor) => { actors.set(actor.name, (actors.get(actor.name) || 0) + weight); }); });
   return Array.from(actors.entries()).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([actor, count]) => ({ actor, count }));
 }
-
 function processDirectors(watchedItems, ratedItems) {
   const directors = new Map();
   watchedItems?.forEach((item) => { const media = item.movie || item.show; media.crew?.forEach((person) => { if (person.job === "Director") directors.set(person.name, (directors.get(person.name) || 0) + 1); }); });
   ratedItems?.forEach((item) => { const media = item.movie || item.show; const weight = item.rating / 5; media.crew?.forEach((person) => { if (person.job === "Director") directors.set(person.name, (directors.get(person.name) || 0) + weight); }); });
   return Array.from(directors.entries()).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([director, count]) => ({ director, count }));
 }
-
 function processYears(watchedItems, ratedItems) {
   const years = new Map();
   watchedItems?.forEach((item) => { const media = item.movie || item.show; const year = parseInt(media.year); if (year) years.set(year, (years.get(year) || 0) + 1); });
@@ -249,13 +315,11 @@ function processYears(watchedItems, ratedItems) {
   if (years.size === 0) return null;
   return { start: Math.min(...years.keys()), end: Math.max(...years.keys()), preferred: Array.from(years.entries()).sort((a, b) => b[1] - a[1])[0]?.[0] };
 }
-
 function processRatings(ratedItems) {
   const ratings = new Map();
   ratedItems?.forEach((item) => { ratings.set(item.rating, (ratings.get(item.rating) || 0) + 1); });
   return Array.from(ratings.entries()).sort((a, b) => b[1] - a[1]).map(([rating, count]) => ({ rating, count }));
 }
-
 async function processPreferencesInParallel(watched, rated, history) {
   const [genres, actors, directors, yearRange, ratings] = await Promise.all([
     Promise.resolve(processGenres(watched, rated)),
@@ -268,19 +332,12 @@ async function processPreferencesInParallel(watched, rated, history) {
 }
 
 function createErrorMeta(title, message) {
-  const words = message.split(' ');
-  let lines = [];
-  let currentLine = words[0] || '';
-  for (let i = 1; i < words.length; i++) {
-    let testLine = currentLine + ' ' + words[i];
-    if (testLine.length > 35) { lines.push(currentLine); currentLine = words[i]; }
-    else currentLine = testLine;
-  }
+  const words = message.split(' '); let lines = []; let currentLine = words[0] || '';
+  for (let i = 1; i < words.length; i++) { let testLine = currentLine + ' ' + words[i]; if (testLine.length > 35) { lines.push(currentLine); currentLine = words[i]; } else currentLine = testLine; }
   lines.push(currentLine);
   const messageTspans = lines.map((line, index) => `<tspan x="250" y="${560 + index * 30}">${line}</tspan>`).join('');
   const svg = `<svg width="500" height="750" xmlns="http://www.w3.org/2000/svg"><rect width="100%" height="100%" fill="#2d2d2d" /><path d="M250 50 L450 400 L50 400 Z" fill="#c0392b"/><path d="M250 120 L400 380 L100 380 Z" fill="#e74c3c"/><text fill="white" font-size="60" font-family="Arial, sans-serif" x="250" y="270" text-anchor="middle" font-weight="bold">!</text><text fill="white" font-size="32" font-family="Arial, sans-serif" x="250" y="500" text-anchor="middle" font-weight="bold">${title}</text><text fill="white" font-size="24" font-family="Arial, sans-serif" text-anchor="middle">${messageTspans}</text><text fill="#bdc3c7" font-size="20" font-family="Arial, sans-serif" x="250" y="700" text-anchor="middle">Please check the addon configuration.</text></svg>`;
-  const posterDataUri = `data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}`;
-  return { id: `error:${title.replace(/\s+/g, '_')}`, type: 'movie', name: title, description: message, poster: posterDataUri, posterShape: 'regular' };
+  return { id: `error:${title.replace(/\s+/g, '_')}`, type: 'movie', name: title, description: message, poster: `data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}`, posterShape: 'regular' };
 }
 
 async function fetchTraktIncrementalData(clientId, accessToken, type, lastUpdate) {
@@ -291,14 +348,15 @@ async function fetchTraktIncrementalData(clientId, accessToken, type, lastUpdate
     `${TRAKT_API_BASE}/users/me/history/${type}?extended=full&start_at=${startDate}&page=1&limit=100`,
   ];
   const headers = { "Content-Type": "application/json", "trakt-api-version": "2", "trakt-api-key": clientId, Authorization: `Bearer ${accessToken}` };
-  const responses = await Promise.all(endpoints.map((endpoint) => makeApiCall(endpoint, headers).then((res) => res.json()).catch((err) => { logger.error("Trakt API Error:", { endpoint, error: err.message }); return []; })));
+  const responses = await Promise.all(endpoints.map((endpoint) =>
+    fetch(endpoint, { headers }).then((res) => res.json()).catch((err) => { logger.error("Trakt API Error:", { endpoint, error: err.message }); return []; })
+  ));
   return { watched: responses[0] || [], rated: responses[1] || [], history: responses[2] || [] };
 }
 
 async function fetchTraktWatchedAndRated(clientId, accessToken, type = "movies", config = null) {
   logger.info("fetchTraktWatchedAndRated called", { hasClientId: !!clientId, hasAccessToken: !!accessToken, type });
   if (!clientId || !accessToken) { logger.error("Missing Trakt credentials"); return null; }
-
   const makeApiCall = async (url, headers) => {
     return await withRetry(async () => {
       const response = await fetch(url, { headers });
@@ -306,38 +364,20 @@ async function fetchTraktWatchedAndRated(clientId, accessToken, type = "movies",
       return response;
     }, { maxRetries: 3, baseDelay: 1000, shouldRetry: (error) => !error.status || (error.status !== 401 && error.status !== 403), operationName: "Trakt API call" });
   };
-
   const rawCacheKey = `trakt_raw_${accessToken}_${type}`;
   const processedCacheKey = `trakt_${accessToken}_${type}`;
-
-  if (traktCache.has(processedCacheKey)) {
-    const cached = traktCache.get(processedCacheKey);
-    logger.info("Trakt processed cache hit", { cacheKey: processedCacheKey, type });
-    return cached.data;
-  }
-
-  let rawData;
-  let isIncremental = false;
-
+  if (traktCache.has(processedCacheKey)) { return traktCache.get(processedCacheKey).data; }
+  let rawData; let isIncremental = false;
   if (traktRawDataCache.has(rawCacheKey)) {
     const cachedRaw = traktRawDataCache.get(rawCacheKey);
     const lastUpdate = cachedRaw.lastUpdate || cachedRaw.timestamp;
     try {
       const newData = await fetchTraktIncrementalData(clientId, accessToken, type, lastUpdate);
-      rawData = {
-        watched: mergeAndDeduplicate(newData.watched, cachedRaw.data.watched),
-        rated: mergeAndDeduplicate(newData.rated, cachedRaw.data.rated),
-        history: mergeAndDeduplicate(newData.history, cachedRaw.data.history),
-        lastUpdate: Date.now(),
-      };
+      rawData = { watched: mergeAndDeduplicate(newData.watched, cachedRaw.data.watched), rated: mergeAndDeduplicate(newData.rated, cachedRaw.data.rated), history: mergeAndDeduplicate(newData.history, cachedRaw.data.history), lastUpdate: Date.now() };
       isIncremental = true;
       traktRawDataCache.set(rawCacheKey, { timestamp: Date.now(), lastUpdate: Date.now(), data: rawData });
-    } catch (error) {
-      logger.error("Incremental Trakt update failed, falling back to full refresh", { error: error.message });
-      isIncremental = false;
-    }
+    } catch (error) { logger.error("Incremental Trakt update failed", { error: error.message }); isIncremental = false; }
   }
-
   if (!rawData) {
     try {
       const endpoints = [
@@ -350,12 +390,8 @@ async function fetchTraktWatchedAndRated(clientId, accessToken, type = "movies",
       const [watched, rated, history] = responses;
       rawData = { watched: watched || [], rated: rated || [], history: history || [], lastUpdate: Date.now() };
       traktRawDataCache.set(rawCacheKey, { timestamp: Date.now(), lastUpdate: Date.now(), data: rawData });
-    } catch (error) {
-      logger.error("Trakt API Error:", { error: error.message, stack: error.stack });
-      return null;
-    }
+    } catch (error) { logger.error("Trakt API Error:", { error: error.message }); return null; }
   }
-
   const preferences = await processPreferencesInParallel(rawData.watched, rawData.rated, rawData.history);
   const result = { watched: rawData.watched, rated: rawData.rated, history: rawData.history, preferences, lastUpdate: rawData.lastUpdate, isIncrementalUpdate: isIncremental };
   traktCache.set(processedCacheKey, { timestamp: Date.now(), data: result });
@@ -363,10 +399,8 @@ async function fetchTraktWatchedAndRated(clientId, accessToken, type = "movies",
 }
 
 async function searchTMDB(title, type, year, tmdbKey, language = "en-US", includeAdult = false) {
-  const startTime = Date.now();
   const cacheKey = `${title}-${type}-${year}-${language}-adult:${includeAdult}`;
   if (tmdbCache.has(cacheKey)) return tmdbCache.get(cacheKey).data;
-
   try {
     const searchType = type === "movie" ? "movie" : "tv";
     const searchParams = new URLSearchParams({ api_key: tmdbKey, query: title, year: year, include_adult: includeAdult, language: language });
@@ -376,88 +410,56 @@ async function searchTMDB(title, type, year, tmdbKey, language = "en-US", includ
       if (!searchResponse.ok) {
         const errorData = await searchResponse.json().catch(() => ({}));
         let errorMessage = searchResponse.status === 401 ? "Invalid TMDB API key" : searchResponse.status === 429 ? "TMDB API rate limit exceeded" : `TMDB API error: ${searchResponse.status} ${errorData?.status_message || ""}`;
-        const error = new Error(errorMessage);
-        error.status = searchResponse.status;
-        error.isRateLimit = searchResponse.status === 429;
-        error.isInvalidKey = searchResponse.status === 401;
-        throw error;
+        const error = new Error(errorMessage); error.status = searchResponse.status; error.isRateLimit = searchResponse.status === 429; error.isInvalidKey = searchResponse.status === 401; throw error;
       }
       return searchResponse.json();
-    }, { maxRetries: 3, initialDelay: 1000, maxDelay: 8000, operationName: "TMDB search API call", shouldRetry: (error) => !error.isInvalidKey && (!error.status || error.status >= 500 || error.isRateLimit) });
-
+    }, { maxRetries: 3, initialDelay: 1000, maxDelay: 8000, operationName: "TMDB search", shouldRetry: (error) => !error.isInvalidKey && (!error.status || error.status >= 500 || error.isRateLimit) });
     if (responseData?.results?.[0]) {
       const result = responseData.results[0];
       const tmdbData = { poster: result.poster_path ? `https://image.tmdb.org/t/p/w500${result.poster_path}` : null, backdrop: result.backdrop_path ? `https://image.tmdb.org/t/p/original${result.backdrop_path}` : null, tmdbRating: result.vote_average, genres: result.genre_ids, overview: result.overview || "", tmdb_id: result.id, title: result.title || result.name, release_date: result.release_date || result.first_air_date };
-
       if (!tmdbData.imdb_id) {
         const detailsCacheKey = `details_${searchType}_${result.id}_${language}`;
         let detailsData;
-        if (tmdbDetailsCache.has(detailsCacheKey)) {
-          detailsData = tmdbDetailsCache.get(detailsCacheKey).data;
-        } else {
+        if (tmdbDetailsCache.has(detailsCacheKey)) { detailsData = tmdbDetailsCache.get(detailsCacheKey).data; }
+        else {
           const detailsUrl = `${TMDB_API_BASE}/${searchType}/${result.id}?api_key=${tmdbKey}&append_to_response=external_ids&language=${language}`;
-          detailsData = await withRetry(async () => {
-            const detailsResponse = await fetch(detailsUrl);
-            if (!detailsResponse.ok) throw new Error(`TMDB details API error: ${detailsResponse.status}`);
-            return detailsResponse.json();
-          }, { maxRetries: 3, initialDelay: 1000, maxDelay: 8000, operationName: "TMDB details API call" });
+          detailsData = await withRetry(async () => { const r = await fetch(detailsUrl); if (!r.ok) throw new Error(`TMDB details error: ${r.status}`); return r.json(); }, { maxRetries: 3, initialDelay: 1000, maxDelay: 8000, operationName: "TMDB details" });
           tmdbDetailsCache.set(detailsCacheKey, { timestamp: Date.now(), data: detailsData });
         }
         if (detailsData) tmdbData.imdb_id = detailsData.imdb_id || detailsData.external_ids?.imdb_id;
       }
-
       tmdbCache.set(cacheKey, { timestamp: Date.now(), data: tmdbData });
       return tmdbData;
     }
     tmdbCache.set(cacheKey, { timestamp: Date.now(), data: null });
     return null;
-  } catch (error) {
-    logger.error("TMDB Search Error:", { error: error.message, params: { title, type, year } });
-    return null;
-  }
+  } catch (error) { logger.error("TMDB Search Error:", { error: error.message, params: { title, type, year } }); return null; }
 }
 
 async function searchTMDBExactMatch(title, type, tmdbKey, language = "en-US", includeAdult = false) {
   const cacheKey = `tmdb_search_${title}-${type}-${language}-adult:${includeAdult}`;
   if (tmdbCache.has(cacheKey)) {
     const responseData = tmdbCache.get(cacheKey).data;
-    if (responseData && responseData.length > 0) {
-      const normalizedTitle = title.toLowerCase().trim();
-      const exactMatch = responseData.find((result) => (result.title || result.name || "").toLowerCase().trim() === normalizedTitle);
-      return { isExactMatch: !!exactMatch, results: responseData };
-    }
+    if (responseData && responseData.length > 0) { const normalizedTitle = title.toLowerCase().trim(); const exactMatch = responseData.find((r) => (r.title || r.name || "").toLowerCase().trim() === normalizedTitle); return { isExactMatch: !!exactMatch, results: responseData }; }
     return { isExactMatch: false, results: [] };
   }
-
   try {
     const searchType = type === "movie" ? "movie" : "tv";
     const searchParams = new URLSearchParams({ api_key: tmdbKey, query: title, include_adult: includeAdult, language: language });
     const searchUrl = `${TMDB_API_BASE}/search/${searchType}?${searchParams.toString()}`;
-    const responseData = await withRetry(async () => {
-      const searchResponse = await fetch(searchUrl);
-      if (!searchResponse.ok) throw new Error(`TMDB search error: ${searchResponse.status}`);
-      return searchResponse.json();
-    }, { maxRetries: 3, initialDelay: 1000, maxDelay: 8000, operationName: "TMDB search API call", shouldRetry: (error) => !error.status || error.status >= 500 });
-
+    const responseData = await withRetry(async () => { const r = await fetch(searchUrl); if (!r.ok) throw new Error(`TMDB search error: ${r.status}`); return r.json(); }, { maxRetries: 3, initialDelay: 1000, maxDelay: 8000, operationName: "TMDB exact match search", shouldRetry: (e) => !e.status || e.status >= 500 });
     const results = responseData?.results || [];
     tmdbCache.set(cacheKey, { timestamp: Date.now(), data: results });
-    if (results.length > 0) {
-      const normalizedTitle = title.toLowerCase().trim();
-      const exactMatch = results.find((result) => (result.title || result.name || "").toLowerCase().trim() === normalizedTitle);
-      return { isExactMatch: !!exactMatch, results };
-    }
+    if (results.length > 0) { const normalizedTitle = title.toLowerCase().trim(); const exactMatch = results.find((r) => (r.title || r.name || "").toLowerCase().trim() === normalizedTitle); return { isExactMatch: !!exactMatch, results }; }
     return { isExactMatch: false, results: [] };
-  } catch (error) {
-    logger.error("TMDB Search Error:", { error: error.message, params: { title, type } });
-    return { isExactMatch: false, results: [] };
-  }
+  } catch (error) { logger.error("TMDB Search Error:", { error: error.message }); return { isExactMatch: false, results: [] }; }
 }
 
 const manifest = {
   id: "au.itcon.aisearch",
-  version: "1.0.65-local-llm",
+  version: "1.0.66-local-llm",
   name: "AI Search (Local LLM)",
-  description: "AI-powered movie and series recommendations using your local LLM",
+  description: "AI-powered movie and series recommendations using your local LLM, with live TMDB data for current releases",
   resources: ["catalog", "meta", { name: "stream", types: ["movie", "series"], idPrefixes: ["tt"] }],
   types: ["movie", "series"],
   catalogs: [
@@ -480,17 +482,17 @@ function determineIntentFromKeywords(query) {
   const movieKeywords = { strong: [/\bmovie(s)?\b/, /\bfilm(s)?\b/, /\bcinema\b/, /\bfeature\b/, /\bmotion picture\b/], medium: [/\bdirector\b/, /\bscreenplay\b/, /\bboxoffice\b/, /\btheater\b/, /\btheatre\b/, /\bcinematic\b/], weak: [/\bwatch\b/, /\bactor\b/, /\bactress\b/, /\bscreenwriter\b/, /\bproducer\b/] };
   const seriesKeywords = { strong: [/\bseries\b/, /\btv show(s)?\b/, /\btelevision\b/, /\bshow(s)?\b/, /\bepisode(s)?\b/, /\bseason(s)?\b/, /\bdocumentary?\b/, /\bdocumentaries?\b/], medium: [/\bnetflix\b/, /\bhbo\b/, /\bhulu\b/, /\bamazon prime\b/, /\bdisney\+\b/, /\bapple tv\+\b/, /\bpilot\b/, /\bfinale\b/], weak: [/\bcharacter\b/, /\bcast\b/, /\bplot\b/, /\bstoryline\b/, /\bnarrative\b/] };
   let movieScore = 0; let seriesScore = 0;
-  for (const pattern of movieKeywords.strong) { if (pattern.test(normalizedQuery)) movieScore += 3; }
-  for (const pattern of movieKeywords.medium) { if (pattern.test(normalizedQuery)) movieScore += 2; }
-  for (const pattern of movieKeywords.weak) { if (pattern.test(normalizedQuery)) movieScore += 1; }
-  for (const pattern of seriesKeywords.strong) { if (pattern.test(normalizedQuery)) seriesScore += 3; }
-  for (const pattern of seriesKeywords.medium) { if (pattern.test(normalizedQuery)) seriesScore += 2; }
-  for (const pattern of seriesKeywords.weak) { if (pattern.test(normalizedQuery)) seriesScore += 1; }
+  for (const p of movieKeywords.strong) { if (p.test(normalizedQuery)) movieScore += 3; }
+  for (const p of movieKeywords.medium) { if (p.test(normalizedQuery)) movieScore += 2; }
+  for (const p of movieKeywords.weak) { if (p.test(normalizedQuery)) movieScore += 1; }
+  for (const p of seriesKeywords.strong) { if (p.test(normalizedQuery)) seriesScore += 3; }
+  for (const p of seriesKeywords.medium) { if (p.test(normalizedQuery)) seriesScore += 2; }
+  for (const p of seriesKeywords.weak) { if (p.test(normalizedQuery)) seriesScore += 1; }
   if (/\b(netflix|hulu|hbo|disney\+|apple tv\+)\b/.test(normalizedQuery)) seriesScore += 1;
   if (/\b(cinema|theatrical|box office|imax)\b/.test(normalizedQuery)) movieScore += 1;
   if (/\b\d{4}-\d{4}\b/.test(normalizedQuery)) seriesScore += 1;
-  const scoreDifference = Math.abs(movieScore - seriesScore);
-  if (scoreDifference < 2) return "ambiguous";
+  const diff = Math.abs(movieScore - seriesScore);
+  if (diff < 2) return "ambiguous";
   return movieScore > seriesScore ? "movie" : "series";
 }
 
@@ -504,8 +506,7 @@ function extractGenreCriteria(query) {
   Object.keys(genreAliases).forEach((alias) => { supportedGenres.add(alias); });
   const combinedPattern = /(?:action[- ]comedy|romantic[- ]comedy|sci-?fi[- ]horror|dark[- ]comedy|romantic[- ]thriller)/i;
   const notPattern = /\b(?:not|no|except|excluding)\s+(\w+(?:\s+\w+)?)/gi;
-  const excludedGenres = new Set();
-  let match;
+  const excludedGenres = new Set(); let match;
   while ((match = notPattern.exec(q)) !== null) {
     const negatedTerm = match[1].toLowerCase().trim();
     if (supportedGenres.has(negatedTerm)) { excludedGenres.add(genreAliases[negatedTerm] || negatedTerm); }
@@ -514,8 +515,8 @@ function extractGenreCriteria(query) {
   const genres = { include: [], exclude: Array.from(excludedGenres), mood: [], style: [] };
   const combinedMatch = q.match(combinedPattern);
   if (combinedMatch) genres.include.push(combinedMatch[0].toLowerCase().replace(/\s+/g, "-"));
-  for (const [genre, pattern] of Object.entries(basicGenres)) { if (pattern.test(q) && !excludedGenres.has(genre)) { const genreIndex = q.search(pattern); const beforeGenre = q.substring(0, genreIndex); if (!beforeGenre.match(/\b(not|no|except|excluding)\s+$/)) genres.include.push(genre); } }
-  for (const [subgenre, pattern] of Object.entries(subGenres)) { if (pattern.test(q) && !excludedGenres.has(subgenre)) { const genreIndex = q.search(pattern); const beforeGenre = q.substring(0, genreIndex); if (!beforeGenre.match(/\b(not|no|except|excluding)\s+$/)) genres.include.push(subgenre); } }
+  for (const [genre, pattern] of Object.entries(basicGenres)) { if (pattern.test(q) && !excludedGenres.has(genre)) { const gi = q.search(pattern); const bg = q.substring(0, gi); if (!bg.match(/\b(not|no|except|excluding)\s+$/)) genres.include.push(genre); } }
+  for (const [subgenre, pattern] of Object.entries(subGenres)) { if (pattern.test(q) && !excludedGenres.has(subgenre)) { const gi = q.search(pattern); const bg = q.substring(0, gi); if (!bg.match(/\b(not|no|except|excluding)\s+$/)) genres.include.push(subgenre); } }
   for (const [mood, pattern] of Object.entries(moods)) { if (pattern.test(q)) genres.mood.push(mood); }
   return Object.values(genres).some((arr) => arr.length > 0) ? genres : null;
 }
@@ -524,17 +525,14 @@ function isRecommendationQuery(query) { return query.toLowerCase().trim().starts
 
 function isItemWatchedOrRated(item, watchHistory, ratedItems) {
   if (!item) return false;
-  const normalizedName = item.name.toLowerCase().trim();
-  const itemYear = parseInt(item.year);
-  const isWatched = watchHistory && watchHistory.length > 0 && watchHistory.some((historyItem) => { const media = historyItem.movie || historyItem.show; if (!media) return false; const historyName = media.title.toLowerCase().trim(); const historyYear = parseInt(media.year); return normalizedName === historyName && (!itemYear || !historyYear || itemYear === historyYear); });
-  const isRated = ratedItems && ratedItems.length > 0 && ratedItems.some((ratedItem) => { const media = ratedItem.movie || ratedItem.show; if (!media) return false; const ratedName = media.title.toLowerCase().trim(); const ratedYear = parseInt(media.year); return normalizedName === ratedName && (!itemYear || !ratedYear || itemYear === ratedYear); });
+  const normalizedName = item.name.toLowerCase().trim(); const itemYear = parseInt(item.year);
+  const isWatched = watchHistory && watchHistory.length > 0 && watchHistory.some((h) => { const media = h.movie || h.show; if (!media) return false; return media.title.toLowerCase().trim() === normalizedName && (!itemYear || !parseInt(media.year) || itemYear === parseInt(media.year)); });
+  const isRated = ratedItems && ratedItems.length > 0 && ratedItems.some((r) => { const media = r.movie || r.show; if (!media) return false; return media.title.toLowerCase().trim() === normalizedName && (!itemYear || !parseInt(media.year) || itemYear === parseInt(media.year)); });
   return isWatched || isRated;
 }
 
 async function getLandscapeThumbnail(tmdbData, imdbId, fanartApiKey, tmdbKey) {
-  if (fanartApiKey && imdbId) {
-    try { const fanartThumb = await fetchFanartThumbnail(imdbId, fanartApiKey); if (fanartThumb) return fanartThumb; } catch (error) { logger.debug("Fanart.tv thumbnail fetch failed", { imdbId, error: error.message }); }
-  }
+  if (fanartApiKey && imdbId) { try { const t = await fetchFanartThumbnail(imdbId, fanartApiKey); if (t) return t; } catch (e) { logger.debug("Fanart fetch failed", { error: e.message }); } }
   if (tmdbData.backdrop) return tmdbData.backdrop.replace('/original', '/w780');
   return tmdbData.poster;
 }
@@ -546,17 +544,12 @@ async function fetchFanartThumbnail(imdbId, fanartApiKey) {
   const cacheKey = `fanart_thumb_${imdbId}`;
   if (fanartCache.has(cacheKey)) return fanartCache.get(cacheKey).data;
   try {
-    let FanartApi;
-    try { FanartApi = require("fanart.tv"); } catch (requireError) { return null; }
+    let FanartApi; try { FanartApi = require("fanart.tv"); } catch (e) { return null; }
     const fanart = new FanartApi(effectiveFanartKey);
-    const data = await withRetry(async () => await fanart.movies.get(imdbId), { maxRetries: 3, baseDelay: 1000, shouldRetry: (error) => !error.status || error.status !== 401, operationName: "Fanart.tv API call" });
-    const thumbnail = data?.moviethumb?.filter(thumb => thumb.lang === 'en' || !thumb.lang || thumb.lang.trim() === '')?.sort((a, b) => b.likes - a.likes)[0]?.url;
-    fanartCache.set(cacheKey, { timestamp: Date.now(), data: thumbnail });
-    return thumbnail;
-  } catch (error) {
-    fanartCache.set(cacheKey, { timestamp: Date.now(), data: null });
-    return null;
-  }
+    const data = await withRetry(async () => await fanart.movies.get(imdbId), { maxRetries: 3, baseDelay: 1000, shouldRetry: (e) => !e.status || e.status !== 401, operationName: "Fanart.tv" });
+    const thumbnail = data?.moviethumb?.filter(t => t.lang === 'en' || !t.lang || t.lang.trim() === '')?.sort((a, b) => b.likes - a.likes)[0]?.url;
+    fanartCache.set(cacheKey, { timestamp: Date.now(), data: thumbnail }); return thumbnail;
+  } catch (error) { fanartCache.set(cacheKey, { timestamp: Date.now(), data: null }); return null; }
 }
 
 async function fetchRpdbPoster(imdbId, rpdbKey, posterType = "poster-default", isTier0User = false) {
@@ -568,20 +561,16 @@ async function fetchRpdbPoster(imdbId, rpdbKey, posterType = "poster-default", i
     const posterUrl = await withRetry(async () => {
       const response = await fetch(url);
       if (response.status === 404) { if (isTier0User) rpdbCache.set(cacheKey, { timestamp: Date.now(), data: null }); return null; }
-      if (!response.ok) { const error = new Error(`RPDB API error: ${response.status}`); error.status = response.status; throw error; }
+      if (!response.ok) { const error = new Error(`RPDB error: ${response.status}`); error.status = response.status; throw error; }
       return url;
-    }, { maxRetries: 2, initialDelay: 1000, maxDelay: 5000, shouldRetry: (error) => error.status !== 404 && (!error.status || error.status >= 500), operationName: "RPDB poster API call" });
-    if (isTier0User) rpdbCache.set(cacheKey, { timestamp: Date.now(), data: posterUrl });
-    return posterUrl;
-  } catch (error) {
-    logger.error("RPDB API Error:", { error: error.message, imdbId, posterType });
-    return null;
-  }
+    }, { maxRetries: 2, initialDelay: 1000, maxDelay: 5000, shouldRetry: (e) => e.status !== 404 && (!e.status || e.status >= 500), operationName: "RPDB poster" });
+    if (isTier0User) rpdbCache.set(cacheKey, { timestamp: Date.now(), data: posterUrl }); return posterUrl;
+  } catch (error) { logger.error("RPDB Error:", { error: error.message }); return null; }
 }
 
 function getRpdbTierFromApiKey(apiKey) {
   if (!apiKey) return -1;
-  try { const tierMatch = apiKey.match(/^t(\d+)-/); if (tierMatch && tierMatch[1] !== undefined) return parseInt(tierMatch[1]); return -1; } catch (error) { return -1; }
+  try { const m = apiKey.match(/^t(\d+)-/); return m && m[1] !== undefined ? parseInt(m[1]) : -1; } catch (e) { return -1; }
 }
 
 async function toStremioMeta(item, platform = "unknown", tmdbKey, rpdbKey, rpdbPosterType = "poster-default", language = "en-US", config, includeAdult = false) {
@@ -589,29 +578,26 @@ async function toStremioMeta(item, platform = "unknown", tmdbKey, rpdbKey, rpdbP
   const type = item.type || (item.id.includes("movie") ? "movie" : "series");
   const enableRpdb = config?.EnableRpdb !== undefined ? config.EnableRpdb : false;
   const userRpdbKey = config?.RpdbApiKey;
-  const usingUserKey = !!userRpdbKey;
-  const usingDefaultKey = !userRpdbKey && !!DEFAULT_RPDB_KEY;
-  const userTier = usingUserKey ? getRpdbTierFromApiKey(userRpdbKey) : -1;
-  const isTier0User = (usingUserKey && userTier === 0) || usingDefaultKey;
+  const isTier0User = (!!userRpdbKey && getRpdbTierFromApiKey(userRpdbKey) === 0) || (!userRpdbKey && !!DEFAULT_RPDB_KEY);
   const tmdbData = await searchTMDB(item.name, type, item.year, tmdbKey, language, includeAdult);
   if (!tmdbData || !tmdbData.imdb_id) return null;
   let poster = tmdbData.poster;
   const effectiveRpdbKey = userRpdbKey || DEFAULT_RPDB_KEY;
   if (enableRpdb && effectiveRpdbKey && tmdbData.imdb_id) {
-    try { const rpdbPoster = await fetchRpdbPoster(tmdbData.imdb_id, effectiveRpdbKey, rpdbPosterType, isTier0User); if (rpdbPoster) poster = rpdbPoster; } catch (error) { logger.debug("RPDB poster fetch failed", { error: error.message }); }
+    try { const rp = await fetchRpdbPoster(tmdbData.imdb_id, effectiveRpdbKey, rpdbPosterType, isTier0User); if (rp) poster = rp; } catch (e) { logger.debug("RPDB poster failed", { error: e.message }); }
   }
   if (!poster) return null;
-  const meta = { id: tmdbData.imdb_id, type: type, name: tmdbData.title || tmdbData.name, description: platform === "android-tv" ? (tmdbData.overview || "").slice(0, 200) : tmdbData.overview || "", year: parseInt(item.year) || 0, poster: platform === "android-tv" && poster.includes("/w500/") ? poster.replace("/w500/", "/w342/") : poster, background: tmdbData.backdrop, posterShape: "regular" };
+  const meta = { id: tmdbData.imdb_id, type, name: tmdbData.title || tmdbData.name, description: platform === "android-tv" ? (tmdbData.overview || "").slice(0, 200) : tmdbData.overview || "", year: parseInt(item.year) || 0, poster: platform === "android-tv" && poster.includes("/w500/") ? poster.replace("/w500/", "/w342/") : poster, background: tmdbData.backdrop, posterShape: "regular" };
   if (tmdbData.genres && tmdbData.genres.length > 0) meta.genres = tmdbData.genres.map((id) => (type === "series" ? TMDB_TV_GENRES[id] : TMDB_GENRES[id])).filter(Boolean);
   return meta;
 }
 
 function detectPlatform(extra = {}) {
   if (extra.headers?.["stremio-platform"]) return extra.headers["stremio-platform"];
-  const userAgent = (extra.userAgent || extra.headers?.["stremio-user-agent"] || "").toLowerCase();
-  if (userAgent.includes("android tv") || userAgent.includes("chromecast") || userAgent.includes("androidtv")) return "android-tv";
-  if (userAgent.includes("android") || userAgent.includes("mobile") || userAgent.includes("phone")) return "mobile";
-  if (userAgent.includes("windows") || userAgent.includes("macintosh") || userAgent.includes("linux")) return "desktop";
+  const ua = (extra.userAgent || extra.headers?.["stremio-user-agent"] || "").toLowerCase();
+  if (ua.includes("android tv") || ua.includes("chromecast") || ua.includes("androidtv")) return "android-tv";
+  if (ua.includes("android") || ua.includes("mobile") || ua.includes("phone")) return "mobile";
+  if (ua.includes("windows") || ua.includes("macintosh") || ua.includes("linux")) return "desktop";
   return "unknown";
 }
 
@@ -621,40 +607,35 @@ async function getTmdbDetailsByImdbId(imdbId, type, tmdbKey, language = "en-US")
   try {
     const findUrl = `${TMDB_API_BASE}/find/${imdbId}?api_key=${tmdbKey}&language=${language}&external_source=imdb_id`;
     const response = await fetch(findUrl);
-    if (!response.ok) throw new Error(`TMDB find API error: ${response.status}`);
+    if (!response.ok) throw new Error(`TMDB find error: ${response.status}`);
     const data = await response.json();
     const results = type === 'movie' ? data.movie_results : data.tv_results;
-    if (results && results.length > 0) { const details = results[0]; tmdbDetailsCache.set(cacheKey, { timestamp: Date.now(), data: details }); return details; }
+    if (results && results.length > 0) { tmdbDetailsCache.set(cacheKey, { timestamp: Date.now(), data: results[0] }); return results[0]; }
     return null;
-  } catch (error) { logger.error("Error fetching TMDB details by IMDB ID", { imdbId, error: error.message }); return null; }
+  } catch (error) { logger.error("TMDB details by IMDB ID error", { imdbId, error: error.message }); return null; }
 }
 
 const TMDB_GENRES = { 28: "Action", 12: "Adventure", 16: "Animation", 35: "Comedy", 80: "Crime", 99: "Documentary", 18: "Drama", 10751: "Family", 14: "Fantasy", 36: "History", 27: "Horror", 10402: "Music", 9648: "Mystery", 10749: "Romance", 878: "Science Fiction", 10770: "TV Movie", 53: "Thriller", 10752: "War", 37: "Western" };
 const TMDB_TV_GENRES = { 10759: "Action & Adventure", 16: "Animation", 35: "Comedy", 80: "Crime", 99: "Documentary", 18: "Drama", 10751: "Family", 10762: "Kids", 9648: "Mystery", 10763: "News", 10764: "Reality", 10765: "Sci-Fi & Fantasy", 10766: "Soap", 10767: "Talk", 10768: "War & Politics", 37: "Western" };
 
-function clearTmdbCache() { const size = tmdbCache.size; tmdbCache.clear(); return { cleared: true, previousSize: size }; }
-function clearTmdbDetailsCache() { const size = tmdbDetailsCache.size; tmdbDetailsCache.clear(); return { cleared: true, previousSize: size }; }
-function clearTmdbDiscoverCache() { const size = tmdbDiscoverCache.size; tmdbDiscoverCache.clear(); return { cleared: true, previousSize: size }; }
-function removeTmdbDiscoverCacheItem(cacheKey) { if (!cacheKey) return { success: false, message: "No cache key provided" }; if (!tmdbDiscoverCache.has(cacheKey)) return { success: false, message: "Cache key not found", key: cacheKey }; tmdbDiscoverCache.delete(cacheKey); return { success: true, message: "Cache item removed successfully", key: cacheKey }; }
-function listTmdbDiscoverCacheKeys() { const keys = Array.from(tmdbDiscoverCache.cache.keys()); return { success: true, count: keys.length, keys: keys }; }
-function clearAiCache() { const size = aiRecommendationsCache.size; aiRecommendationsCache.clear(); return { cleared: true, previousSize: size }; }
+function clearTmdbCache() { const s = tmdbCache.size; tmdbCache.clear(); return { cleared: true, previousSize: s }; }
+function clearTmdbDetailsCache() { const s = tmdbDetailsCache.size; tmdbDetailsCache.clear(); return { cleared: true, previousSize: s }; }
+function clearTmdbDiscoverCache() { const s = tmdbDiscoverCache.size; tmdbDiscoverCache.clear(); return { cleared: true, previousSize: s }; }
+function removeTmdbDiscoverCacheItem(cacheKey) { if (!cacheKey) return { success: false, message: "No cache key" }; if (!tmdbDiscoverCache.has(cacheKey)) return { success: false, message: "Key not found", key: cacheKey }; tmdbDiscoverCache.delete(cacheKey); return { success: true, key: cacheKey }; }
+function listTmdbDiscoverCacheKeys() { return { success: true, count: tmdbDiscoverCache.size, keys: Array.from(tmdbDiscoverCache.cache.keys()) }; }
+function clearAiCache() { const s = aiRecommendationsCache.size; aiRecommendationsCache.clear(); return { cleared: true, previousSize: s }; }
 function removeAiCacheByKeywords(keywords) {
-  if (!keywords || typeof keywords !== "string") throw new Error("Invalid keywords parameter");
-  const searchPhrase = keywords.toLowerCase().trim();
-  const removedEntries = [];
-  let totalRemoved = 0;
-  for (const key of aiRecommendationsCache.keys()) {
-    const query = key.split("_")[0].toLowerCase();
-    if (query.includes(searchPhrase)) { const entry = aiRecommendationsCache.get(key); if (entry) { removedEntries.push({ key, timestamp: new Date(entry.timestamp).toISOString(), query: key.split("_")[0] }); aiRecommendationsCache.delete(key); totalRemoved++; } }
-  }
+  if (!keywords || typeof keywords !== "string") throw new Error("Invalid keywords");
+  const searchPhrase = keywords.toLowerCase().trim(); const removedEntries = []; let totalRemoved = 0;
+  for (const key of aiRecommendationsCache.keys()) { const query = key.split("_")[0].toLowerCase(); if (query.includes(searchPhrase)) { const entry = aiRecommendationsCache.get(key); if (entry) { removedEntries.push({ key, timestamp: new Date(entry.timestamp).toISOString() }); aiRecommendationsCache.delete(key); totalRemoved++; } } }
   return { removed: totalRemoved, entries: removedEntries };
 }
-function clearRpdbCache() { const size = rpdbCache.size; rpdbCache.clear(); return { cleared: true, previousSize: size }; }
-function clearFanartCache() { const size = fanartCache.size; fanartCache.clear(); return { cleared: true, previousSize: size }; }
-function clearTraktCache() { const size = traktCache.size; traktCache.clear(); return { cleared: true, previousSize: size }; }
-function clearTraktRawDataCache() { const size = traktRawDataCache.size; traktRawDataCache.clear(); return { cleared: true, previousSize: size }; }
-function clearQueryAnalysisCache() { const size = queryAnalysisCache.size; queryAnalysisCache.clear(); return { cleared: true, previousSize: size }; }
-function clearSimilarContentCache() { const size = similarContentCache.size; similarContentCache.clear(); return { cleared: true, previousSize: size }; }
+function clearRpdbCache() { const s = rpdbCache.size; rpdbCache.clear(); return { cleared: true, previousSize: s }; }
+function clearFanartCache() { const s = fanartCache.size; fanartCache.clear(); return { cleared: true, previousSize: s }; }
+function clearTraktCache() { const s = traktCache.size; traktCache.clear(); return { cleared: true, previousSize: s }; }
+function clearTraktRawDataCache() { const s = traktRawDataCache.size; traktRawDataCache.clear(); return { cleared: true, previousSize: s }; }
+function clearQueryAnalysisCache() { const s = queryAnalysisCache.size; queryAnalysisCache.clear(); return { cleared: true, previousSize: s }; }
+function clearSimilarContentCache() { const s = similarContentCache.size; similarContentCache.clear(); return { cleared: true, previousSize: s }; }
 
 function getCacheStats() {
   return {
@@ -692,94 +673,64 @@ function deserializeAllCaches(data) {
   return results;
 }
 
-/**
- * Uses local LLM to discover content type and genres for a query
- */
 async function discoverTypeAndGenres(query, llmBaseUrl, llmModel, llmApiKey) {
   const promptText = `Analyze this recommendation query: "${query}"
 
-Determine:
-1. What type of content is being requested (movie, series, or ambiguous)
-2. What genres are relevant to this query
+Respond in a single line:
+type|genre1,genre2
 
-Respond in a single line with pipe-separated format:
-type|genre1,genre2,genre3
-
-Where type is one of: movie, series, ambiguous
-Genres are comma-separated, or "all" if no specific genres apply.
+type = movie, series, or ambiguous
+genres = comma-separated, or "all"
 
 Examples:
-movie|action,thriller,sci-fi
+movie|action,thriller
 series|comedy,drama
-ambiguous|romance,comedy
-movie|all
+ambiguous|all
 
-Do not include any explanatory text. Just the single line.`;
-
+No extra text.`;
   try {
     const text = await callLocalLLM(promptText, llmBaseUrl, llmModel, llmApiKey);
-    const firstLine = text.split("\n")[0].trim();
-    const parts = firstLine.split("|");
+    const firstLine = text.split("\n")[0].trim(); const parts = firstLine.split("|");
     if (parts.length !== 2) return { type: "ambiguous", genres: [] };
     let type = parts[0].trim().toLowerCase();
     if (type !== "movie" && type !== "series") type = "ambiguous";
     const genres = parts[1].split(",").map((g) => g.trim()).filter((g) => g.length > 0 && g.toLowerCase() !== "ambiguous");
     if (genres.length === 1 && genres[0].toLowerCase() === "all") return { type, genres: [] };
     return { type, genres };
-  } catch (error) {
-    logger.error("Genre discovery LLM error", { error: error.message });
-    return { type: "ambiguous", genres: [] };
-  }
+  } catch (error) { logger.error("Genre discovery error", { error: error.message }); return { type: "ambiguous", genres: [] }; }
 }
 
 function filterTraktDataByGenres(traktData, genres) {
   if (!traktData || !genres || genres.length === 0) return { recentlyWatched: [], highlyRated: [], lowRated: [] };
-  const { watched, rated } = traktData;
   const genreSet = new Set(genres.map((g) => g.toLowerCase()));
   const hasMatchingGenre = (item) => { const media = item.movie || item.show; if (!media || !media.genres || media.genres.length === 0) return false; return media.genres.some((g) => genreSet.has(g.toLowerCase())); };
-  return { recentlyWatched: (watched || []).filter(hasMatchingGenre).slice(0, 100), highlyRated: (rated || []).filter((item) => item.rating >= 4).filter(hasMatchingGenre).slice(0, 100), lowRated: (rated || []).filter((item) => item.rating <= 2).filter(hasMatchingGenre).slice(0, 100) };
+  return { recentlyWatched: (traktData.watched || []).filter(hasMatchingGenre).slice(0, 100), highlyRated: (traktData.rated || []).filter((i) => i.rating >= 4).filter(hasMatchingGenre).slice(0, 100), lowRated: (traktData.rated || []).filter((i) => i.rating <= 2).filter(hasMatchingGenre).slice(0, 100) };
 }
 
 function incrementQueryCounter() { queryCounter++; return queryCounter; }
 function getQueryCount() { return queryCounter; }
-function setQueryCount(newCount) { if (typeof newCount !== "number" || newCount < 0) throw new Error("Query count must be a non-negative number"); queryCounter = newCount; return queryCounter; }
+function setQueryCount(newCount) { if (typeof newCount !== "number" || newCount < 0) throw new Error("Invalid count"); queryCounter = newCount; return queryCounter; }
 
 const catalogHandler = async function (args, req) {
-  const startTime = Date.now();
   const { id, type, extra } = args;
   let isHomepageQuery = false;
 
   try {
     const configData = args.config;
-    if (!configData || Object.keys(configData).length === 0) {
-      const errorMeta = createErrorMeta('Configuration Missing', 'The addon has not been configured yet. Please set your API keys.');
-      return { metas: [errorMeta] };
-    }
+    if (!configData || Object.keys(configData).length === 0) return { metas: [createErrorMeta('Configuration Missing', 'Please configure the addon with your API keys.')] };
 
     const tmdbKey = configData.TmdbApiKey;
-    // Use user-configured LLM settings or fall back to server environment defaults
     const llmBaseUrl = configData.LlmBaseUrl || DEFAULT_LLM_BASE_URL;
     const llmModel = configData.LlmModel || DEFAULT_LLM_MODEL;
     const llmApiKey = configData.LlmApiKey || DEFAULT_LLM_API_KEY;
 
-    if (configData.traktConnectionError) {
-      const errorMeta = createErrorMeta('Trakt Connection Failed', 'Your access to Trakt.tv has expired or was revoked. Please log in again via the addon configuration page.');
-      return { metas: [errorMeta] };
-    }
-    if (!tmdbKey || tmdbKey.length < 10) {
-      const errorMeta = createErrorMeta('TMDB API Key Invalid', 'Your TMDB API key is missing or invalid. Please correct it in the addon settings.');
-      return { metas: [errorMeta] };
-    }
+    if (configData.traktConnectionError) return { metas: [createErrorMeta('Trakt Connection Failed', 'Your Trakt access has expired. Please log in again via the addon configuration page.')] };
+    if (!tmdbKey || tmdbKey.length < 10) return { metas: [createErrorMeta('TMDB API Key Invalid', 'Your TMDB API key is missing or invalid.')] };
+
     const tmdbValidationUrl = `https://api.themoviedb.org/3/configuration?api_key=${tmdbKey}`;
     const tmdbResponse = await fetch(tmdbValidationUrl);
-    if (!tmdbResponse.ok) {
-      const errorMeta = createErrorMeta('TMDB API Key Invalid', `The key failed validation (Status: ${tmdbResponse.status}). Please check your TMDB key.`);
-      return { metas: [errorMeta] };
-    }
-    if (!llmBaseUrl) {
-      const errorMeta = createErrorMeta('LLM Not Configured', 'No LLM base URL is set. Please configure LlmBaseUrl in your addon settings or set LLM_BASE_URL on the server.');
-      return { metas: [errorMeta] };
-    }
+    if (!tmdbResponse.ok) return { metas: [createErrorMeta('TMDB API Key Invalid', `Validation failed (Status: ${tmdbResponse.status}).`)] };
+    if (!llmBaseUrl) return { metas: [createErrorMeta('LLM Not Configured', 'No LLM base URL set. Configure LlmBaseUrl or set LLM_BASE_URL on the server.')] };
 
     let searchQuery = "";
     if (typeof extra === "string" && extra.includes("search=")) searchQuery = decodeURIComponent(extra.split("search=")[1]);
@@ -795,16 +746,13 @@ const catalogHandler = async function (args, req) {
           const queryIndex = parseInt(idParts[2], 10);
           const catalogEntries = homepageQueries.split(",").map(q => q.trim());
           if (!isNaN(queryIndex) && catalogEntries[queryIndex]) {
-            const entry = catalogEntries[queryIndex];
-            const parts = entry.split(/:(.*)/s);
-            if (parts.length > 1 && parts[1].trim()) searchQuery = parts[1].trim();
-            else searchQuery = entry;
+            const entry = catalogEntries[queryIndex]; const parts = entry.split(/:(.*)/s);
+            if (parts.length > 1 && parts[1].trim()) searchQuery = parts[1].trim(); else searchQuery = entry;
           }
         }
-        if (!searchQuery) { const errorMeta = createErrorMeta('Configuration Error', 'Could not find the matching homepage query for this catalog.'); return { metas: [errorMeta] }; }
+        if (!searchQuery) return { metas: [createErrorMeta('Configuration Error', 'Could not find matching homepage query.')] };
       } else {
-        const errorMeta = createErrorMeta('Search Required', 'Please enter a search term to get AI recommendations.');
-        return { metas: [errorMeta] };
+        return { metas: [createErrorMeta('Search Required', 'Please enter a search term to get AI recommendations.')] };
       }
     }
 
@@ -814,21 +762,38 @@ const catalogHandler = async function (args, req) {
     let numResults = parseInt(configData.NumResults) || 20;
     if (numResults > 30) numResults = MAX_AI_RECOMMENDATIONS;
     const enableAiCache = configData.EnableAiCache !== undefined ? configData.EnableAiCache : true;
-    const enableRpdb = configData.EnableRpdb !== undefined ? configData.EnableRpdb : false;
     const includeAdult = configData.IncludeAdult === true;
     const platform = detectPlatform(extra);
     const isSearchRequest = (typeof extra === "string" && extra.includes("search=")) || !!extra?.search;
-    if (isSearchRequest) logger.info("Processing search query", { searchQuery, type });
 
     const intent = determineIntentFromKeywords(searchQuery);
     if (intent !== "ambiguous" && intent !== type) return { metas: [] };
 
+    // --- TMDB Discover injection for recency queries ---
+    let recentTmdbContent = [];
+    const recencyQuery = isRecencyQuery(searchQuery);
+    const streamingProvider = detectStreamingProvider(searchQuery);
+    const genreCriteria = extractGenreCriteria(searchQuery);
+
+    if (recencyQuery || streamingProvider) {
+      logger.info("Recency/provider query detected — fetching live TMDB data", { searchQuery, provider: streamingProvider?.name, recency: recencyQuery });
+      const genreIds = genreCriteria?.include?.length > 0 ? genreNamesToTmdbIds(genreCriteria.include, type) : [];
+      // For "new" or "this year" queries look back 3 months, otherwise 12 months
+      const monthsBack = /\bnew\b|\bthis week\b|\bthis month\b|\bnow playing\b/i.test(searchQuery) ? 3 : 12;
+      recentTmdbContent = await fetchRecentTmdbContent(type, tmdbKey, {
+        providerId: streamingProvider?.id,
+        genreIds,
+        language,
+        monthsBack,
+      });
+      logger.info("TMDB Discover injection ready", { count: recentTmdbContent.length, type });
+    }
+
     let exactMatchMeta = null;
     let tmdbInitialResults = [];
-    let matchResult = null;
 
     if (!isRecommendationQuery(searchQuery)) {
-      matchResult = await searchTMDBExactMatch(searchQuery, type, tmdbKey, language, includeAdult);
+      const matchResult = await searchTMDBExactMatch(searchQuery, type, tmdbKey, language, includeAdult);
       if (matchResult) {
         tmdbInitialResults = matchResult.results;
         if (matchResult.isExactMatch) {
@@ -837,7 +802,7 @@ const catalogHandler = async function (args, req) {
           if (exactMatchData) {
             const details = await getTmdbDetailsByImdbId(exactMatchData.id, type, tmdbKey);
             if (details && details.imdb_id) {
-              const exactMatchItem = { id: `exact_${exactMatchData.id}`, name: exactMatchData.title || exactMatchData.name, year: (exactMatchData.release_date || exactMatchData.first_air_date || 'N/A').substring(0, 4), type: type };
+              const exactMatchItem = { id: `exact_${exactMatchData.id}`, name: exactMatchData.title || exactMatchData.name, year: (exactMatchData.release_date || exactMatchData.first_air_date || 'N/A').substring(0, 4), type };
               exactMatchMeta = await toStremioMeta(exactMatchItem, platform, tmdbKey, rpdbKey, rpdbPosterType, language, configData, includeAdult);
             }
           }
@@ -853,91 +818,93 @@ const catalogHandler = async function (args, req) {
     if (isRecommendation) {
       const discoveryResult = await discoverTypeAndGenres(searchQuery, llmBaseUrl, llmModel, llmApiKey);
       discoveredGenres = discoveryResult.genres;
-
       if (DEFAULT_TRAKT_CLIENT_ID && configData.TraktAccessToken) {
         traktData = await fetchTraktWatchedAndRated(DEFAULT_TRAKT_CLIENT_ID, configData.TraktAccessToken, type === "movie" ? "movies" : "shows", configData);
         if (traktData) {
-          if (discoveredGenres.length > 0) {
-            filteredTraktData = filterTraktDataByGenres(traktData, discoveredGenres);
-          } else {
-            filteredTraktData = { recentlyWatched: traktData.watched?.slice(0, 100) || [], highlyRated: (traktData.rated || []).filter((item) => item.rating >= 4).slice(0, 25), lowRated: (traktData.rated || []).filter((item) => item.rating <= 2).slice(0, 25) };
-          }
+          if (discoveredGenres.length > 0) filteredTraktData = filterTraktDataByGenres(traktData, discoveredGenres);
+          else filteredTraktData = { recentlyWatched: traktData.watched?.slice(0, 100) || [], highlyRated: (traktData.rated || []).filter((i) => i.rating >= 4).slice(0, 25), lowRated: (traktData.rated || []).filter((i) => i.rating <= 2).slice(0, 25) };
         }
       }
     }
 
     const cacheKey = `${searchQuery}_${type}_${traktData ? "trakt" : "no_trakt"}`;
-    if (enableAiCache && !traktData && !isHomepageQuery && aiRecommendationsCache.has(cacheKey)) {
+    // Skip cache for recency queries - they need live data every time
+    if (enableAiCache && !traktData && !isHomepageQuery && !recencyQuery && !streamingProvider && aiRecommendationsCache.has(cacheKey)) {
       const cached = aiRecommendationsCache.get(cacheKey);
-      if (cached.configNumResults && numResults > cached.configNumResults) {
-        aiRecommendationsCache.delete(cacheKey);
-      } else if (!cached.data?.recommendations || (type === "movie" && !cached.data.recommendations.movies) || (type === "series" && !cached.data.recommendations.series)) {
-        aiRecommendationsCache.delete(cacheKey);
-      } else {
+      if (cached.configNumResults && numResults > cached.configNumResults) { aiRecommendationsCache.delete(cacheKey); }
+      else if (!cached.data?.recommendations || (type === "movie" && !cached.data.recommendations.movies) || (type === "series" && !cached.data.recommendations.series)) { aiRecommendationsCache.delete(cacheKey); }
+      else {
         const selectedRecommendations = type === "movie" ? cached.data.recommendations.movies || [] : cached.data.recommendations.series || [];
-        if (selectedRecommendations.length === 0) { const errorMeta = createErrorMeta('No Results Found', 'The AI could not find any recommendations for your query.'); return { metas: [errorMeta] }; }
+        if (selectedRecommendations.length === 0) return { metas: [createErrorMeta('No Results Found', 'The AI could not find any recommendations.')] };
         const metas = (await Promise.all(selectedRecommendations.map((item) => toStremioMeta(item, platform, tmdbKey, rpdbKey, rpdbPosterType, language, configData, includeAdult)))).filter(Boolean);
-        if (metas.length === 0 && !exactMatchMeta) { const errorMeta = createErrorMeta('Data Fetch Error', 'Could not retrieve details for any of the AI recommendations.'); return { metas: [errorMeta] }; }
-        let finalMetas = metas;
-        if (exactMatchMeta) finalMetas = [exactMatchMeta, ...metas.filter((meta) => meta.id !== exactMatchMeta.id)];
-        if (finalMetas.length === 0) { const errorMeta = createErrorMeta('No Results Found', 'The AI could not find any recommendations for your query.'); return { metas: [errorMeta] }; }
+        if (metas.length === 0 && !exactMatchMeta) return { metas: [createErrorMeta('Data Fetch Error', 'Could not retrieve details for recommendations.')] };
+        let finalMetas = exactMatchMeta ? [exactMatchMeta, ...metas.filter((m) => m.id !== exactMatchMeta.id)] : metas;
         if (finalMetas.length > 0 && isSearchRequest) incrementQueryCounter();
         return { metas: finalMetas };
       }
     }
 
-    // Build the prompt for local LLM
     try {
-      const genreCriteria = extractGenreCriteria(searchQuery);
       const currentYear = new Date().getFullYear();
-      let franchiseInstruction = `your TOP PRIORITY is to list ALL official mainline movies from that franchise, followed by any relevant spin-offs or related content.`;
-      if (type === 'series') franchiseInstruction = `your TOP PRIORITY is to provide a comprehensive list of ALL television content related to that franchise, including narrative series, documentaries, reality shows, and TV specials.`;
+      let franchiseInstruction = `your TOP PRIORITY is to list ALL official mainline movies from that franchise, followed by spin-offs.`;
+      if (type === 'series') franchiseInstruction = `your TOP PRIORITY is to provide ALL television content in that franchise including series, documentaries, and specials.`;
 
-      let promptLines = [
-        `You are a ${type} recommendation expert. Analyze this query: "${searchQuery}"`,
-        "",
-        "QUERY ANALYSIS:",
-      ];
+      let promptLines = [`You are a ${type} recommendation expert. Analyze this query: "${searchQuery}"`, "", "QUERY ANALYSIS:"];
       if (isRecommendation && discoveredGenres.length > 0) promptLines.push(`Discovered genres: ${discoveredGenres.join(", ")}`);
       else if (genreCriteria?.include?.length > 0) promptLines.push(`Requested genres: ${genreCriteria.include.join(", ")}`);
       if (genreCriteria?.mood?.length > 0) promptLines.push(`Mood/Style: ${genreCriteria.mood.join(", ")}`);
       promptLines.push("");
 
-      if (traktData && isRecommendation) {
-        const { preferences } = traktData;
-        const { recentlyWatched, highlyRated, lowRated } = filteredTraktData || { recentlyWatched: traktData.watched?.slice(0, 100) || [], highlyRated: (traktData.rated || []).filter((item) => item.rating >= 4).slice(0, 25), lowRated: (traktData.rated || []).filter((item) => item.rating <= 2).slice(0, 25) };
-        promptLines.push("USER'S WATCH HISTORY AND PREFERENCES (FILTERED BY RELEVANT GENRES):", "");
-        if (recentlyWatched.length > 0) promptLines.push("Recently watched in these genres:", recentlyWatched.slice(0, 25).map((item) => { const media = item.movie || item.show; return `- ${media.title} (${media.year}) - ${media.genres?.join(", ") || "N/A"}`; }).join("\n"), "");
-        if (highlyRated.length > 0) promptLines.push("Highly rated (4-5 stars):", highlyRated.slice(0, 25).map((item) => { const media = item.movie || item.show; return `- ${media.title} (${item.rating}/5) - ${media.genres?.join(", ") || "N/A"}`; }).join("\n"), "");
-        if (lowRated.length > 0) promptLines.push("Low rated (1-2 stars):", lowRated.slice(0, 15).map((item) => { const media = item.movie || item.show; return `- ${media.title} (${item.rating}/5)`; }).join("\n"), "");
-        if (discoveredGenres.length === 0) promptLines.push("Top genres:", preferences.genres.map((g) => `- ${g.genre} (Score: ${g.count.toFixed(2)})`).join("\n"), "");
-        promptLines.push("Favorite actors:", preferences.actors.map((a) => `- ${a.actor}`).join("\n"), "", "Preferred directors:", preferences.directors.map((d) => `- ${d.director}`).join("\n"), "");
+      // Inject live TMDB Discover data if available
+      if (recentTmdbContent.length > 0) {
+        const providerNote = streamingProvider ? ` on ${streamingProvider.name}` : "";
+        const recentTitles = recentTmdbContent.map(item =>
+          `- ${item.title} (${item.year})${item.rating > 0 ? ` [TMDB: ${item.rating.toFixed(1)}]` : ""}${item.overview ? ` — ${item.overview}` : ""}`
+        ).join("\n");
+        promptLines.push(
+          `LIVE DATA FROM TMDB (current releases${providerNote} — these ARE real, recently released titles):`,
+          "IMPORTANT: Prioritize these titles in your response. They are verified current content the LLM may not know about.",
+          "",
+          recentTitles,
+          "",
+          "Use the above as your PRIMARY source. You may add other highly relevant titles from your training data to fill remaining slots.",
+          ""
+        );
       }
 
-      if (tmdbInitialResults.length > 0) {
+      if (traktData && isRecommendation) {
+        const { preferences } = traktData;
+        const { recentlyWatched, highlyRated, lowRated } = filteredTraktData || { recentlyWatched: traktData.watched?.slice(0, 100) || [], highlyRated: (traktData.rated || []).filter((i) => i.rating >= 4).slice(0, 25), lowRated: (traktData.rated || []).filter((i) => i.rating <= 2).slice(0, 25) };
+        promptLines.push("USER WATCH HISTORY & PREFERENCES:", "");
+        if (recentlyWatched.length > 0) promptLines.push("Recently watched:", recentlyWatched.slice(0, 25).map((i) => { const m = i.movie || i.show; return `- ${m.title} (${m.year}) - ${m.genres?.join(", ") || "N/A"}`; }).join("\n"), "");
+        if (highlyRated.length > 0) promptLines.push("Highly rated (4-5 stars):", highlyRated.slice(0, 25).map((i) => { const m = i.movie || i.show; return `- ${m.title} (${i.rating}/5) - ${m.genres?.join(", ") || "N/A"}`; }).join("\n"), "");
+        if (lowRated.length > 0) promptLines.push("Low rated (1-2 stars):", lowRated.slice(0, 15).map((i) => { const m = i.movie || i.show; return `- ${m.title} (${i.rating}/5)`; }).join("\n"), "");
+        promptLines.push("Top genres:", preferences.genres.map((g) => `- ${g.genre}`).join("\n"), "", "Favorite actors:", preferences.actors.map((a) => `- ${a.actor}`).join("\n"), "");
+      }
+
+      if (tmdbInitialResults.length > 0 && recentTmdbContent.length === 0) {
         const initialTitles = tmdbInitialResults.slice(0, 15).map(item => `- ${item.title || item.name} (${(item.release_date || item.first_air_date || 'N/A').substring(0, 4)})`).join('\n');
-        promptLines.push("CONTEXT FROM INITIAL DATABASE SEARCH:", "Use this as primary data source, add similar titles, and sort by relevance:", "", initialTitles, "");
+        promptLines.push("CONTEXT FROM DATABASE SEARCH:", "Use as primary data, add similar titles, sort by relevance:", "", initialTitles, "");
       }
 
       const examplesText = type === 'movie' ? "EXAMPLES:\nmovie|The Matrix|1999\nmovie|Inception|2010" : "EXAMPLES:\nseries|Breaking Bad|2008\nseries|Game of Thrones|2011";
-
       promptLines = promptLines.concat([
         "IMPORTANT INSTRUCTIONS:",
         `- Current year is ${currentYear}.`,
-        `- 'recent' means within the last 2-3 years (${currentYear - 2} to ${currentYear})`,
-        `- 'new' or 'latest' means released in ${currentYear}`,
-        "SPECIFIC QUERY HANDLING:",
-        `1. FRANCHISE/SERIES: If the query is for a specific franchise, ${franchiseInstruction} List them in strict chronological order.`,
-        `2. ACTOR/DIRECTOR FILMOGRAPHY: List their most notable works chronologically.`,
-        `3. GENERAL RECOMMENDATIONS: Provide diverse recommendations matching the query's theme and genre, ordered by relevance.`,
+        `- 'recent' = last 2-3 years (${currentYear - 2} to ${currentYear})`,
+        `- 'new'/'latest' = released in ${currentYear}`,
+        "QUERY HANDLING:",
+        `1. FRANCHISE: ${franchiseInstruction}`,
+        `2. ACTOR/DIRECTOR: List notable works chronologically.`,
+        `3. GENERAL: Diverse recommendations matching theme/genre, ordered by relevance.`,
         "CRITICAL REQUIREMENTS:",
       ]);
-      if (traktData) { promptLines.push(`- DO NOT recommend any content that appears in the user's watch history or ratings above.`, `- Recommend content SIMILAR to the user's highly rated content but NOT THE SAME ones.`); }
+      if (traktData) promptLines.push(`- DO NOT recommend content from the user's watch history above.`, `- Recommend SIMILAR content to highly rated items but NOT the same ones.`);
       promptLines = promptLines.concat([
-        `- You MUST return up to ${numResults} ${type} recommendations.`,
+        `- Return up to ${numResults} ${type} recommendations.`,
         `- Prioritize quality over exact matching.`,
         "",
-        "RESPONSE FORMAT (no additional commentary):",
+        "RESPONSE FORMAT (no extra commentary):",
         "[type]|[name]|[year]",
         "",
         examplesText,
@@ -945,9 +912,9 @@ const catalogHandler = async function (args, req) {
         "RULES:",
         "- Use | separator",
         "- Year: YYYY format",
-        `- Type: accurately label each item as 'movie' or 'series'`,
-        "- Titles: clean official titles only, no extra descriptions",
-        "- Only include officially released movies and TV series",
+        `- Type: label each as 'movie' or 'series'`,
+        "- Clean official titles only",
+        "- Only officially released content",
       ]);
       if (genreCriteria) {
         if (genreCriteria.include.length > 0) promptLines.push(`- Must match genres: ${genreCriteria.include.join(", ")}`);
@@ -956,72 +923,62 @@ const catalogHandler = async function (args, req) {
       }
 
       const promptText = promptLines.join("\n");
-      logger.info("Making local LLM API call", { model: llmModel, baseUrl: llmBaseUrl, query: searchQuery, type });
+      logger.info("Calling local LLM", { model: llmModel, baseUrl: llmBaseUrl, query: searchQuery, type, hasRecentContent: recentTmdbContent.length > 0 });
 
       const text = await callLocalLLM(promptText, llmBaseUrl, llmModel, llmApiKey);
-
-      const lines = text.split("\n").map((line) => line.trim()).filter((line) => line && !line.startsWith("type|"));
+      const lines = text.split("\n").map((l) => l.trim()).filter((l) => l && !l.startsWith("type|"));
       const recommendations = { movies: type === "movie" ? [] : undefined, series: type === "series" ? [] : undefined };
-      let validRecommendations = 0;
-      let invalidLines = 0;
 
       for (const line of lines) {
         try {
-          const parts = line.split("|");
-          let lineType, name, year;
+          const parts = line.split("|"); let lineType, name, year;
           if (parts.length === 3) { [lineType, name, year] = parts.map((s) => s.trim()); }
           else if (parts.length === 2) {
-            lineType = parts[0].trim();
-            const nameWithYear = parts[1].trim();
+            lineType = parts[0].trim(); const nameWithYear = parts[1].trim();
             const yearMatch = nameWithYear.match(/\((\d{4})\)$/);
             if (yearMatch) { year = yearMatch[1]; name = nameWithYear.substring(0, nameWithYear.lastIndexOf("(")).trim(); }
-            else { const anyYearMatch = nameWithYear.match(/\b(19\d{2}|20\d{2})\b/); if (anyYearMatch) { year = anyYearMatch[0]; name = nameWithYear.replace(anyYearMatch[0], "").trim(); } else { invalidLines++; continue; } }
-          } else { invalidLines++; continue; }
+            else { const anyYearMatch = nameWithYear.match(/\b(19\d{2}|20\d{2})\b/); if (anyYearMatch) { year = anyYearMatch[0]; name = nameWithYear.replace(anyYearMatch[0], "").trim(); } else continue; }
+          } else continue;
           const yearNum = parseInt(year);
-          if (!lineType || !name || isNaN(yearNum)) { invalidLines++; continue; }
+          if (!lineType || !name || isNaN(yearNum)) continue;
           if (lineType === type && name && yearNum) {
             const item = { name, year: yearNum, type, id: `ai_${type}_${name.toLowerCase().replace(/[^a-z0-9]+/g, "_")}` };
             if (type === "movie") recommendations.movies.push(item);
             else if (type === "series") recommendations.series.push(item);
-            validRecommendations++;
           }
-        } catch (error) { invalidLines++; }
+        } catch (e) { /* skip malformed line */ }
       }
 
       const finalResult = { recommendations, fromCache: false };
 
       if (traktData && isRecommendation) {
         const watchHistory = traktData.watched.concat(traktData.history || []);
-        if (finalResult.recommendations.movies) finalResult.recommendations.movies = finalResult.recommendations.movies.filter((movie) => !isItemWatchedOrRated(movie, watchHistory, traktData.rated));
-        if (finalResult.recommendations.series) finalResult.recommendations.series = finalResult.recommendations.series.filter((series) => !isItemWatchedOrRated(series, watchHistory, traktData.rated));
+        if (finalResult.recommendations.movies) finalResult.recommendations.movies = finalResult.recommendations.movies.filter((m) => !isItemWatchedOrRated(m, watchHistory, traktData.rated));
+        if (finalResult.recommendations.series) finalResult.recommendations.series = finalResult.recommendations.series.filter((s) => !isItemWatchedOrRated(s, watchHistory, traktData.rated));
       }
 
-      const recommendationsToCache = finalResult.recommendations;
-      const hasMoviesToCache = recommendationsToCache.movies && recommendationsToCache.movies.length > 0;
-      const hasSeriesToCache = recommendationsToCache.series && recommendationsToCache.series.length > 0;
-      if ((hasMoviesToCache || hasSeriesToCache) && !traktData && !isHomepageQuery && enableAiCache) {
+      const hasMovies = finalResult.recommendations.movies && finalResult.recommendations.movies.length > 0;
+      const hasSeries = finalResult.recommendations.series && finalResult.recommendations.series.length > 0;
+      if ((hasMovies || hasSeries) && !traktData && !isHomepageQuery && !recencyQuery && !streamingProvider && enableAiCache) {
         aiRecommendationsCache.set(cacheKey, { timestamp: Date.now(), data: finalResult, configNumResults: numResults });
       }
 
       const selectedRecommendations = type === "movie" ? finalResult.recommendations.movies || [] : finalResult.recommendations.series || [];
       const metas = (await Promise.all(selectedRecommendations.map((item) => toStremioMeta(item, platform, tmdbKey, rpdbKey, rpdbPosterType, language, configData)))).filter(Boolean);
-
-      let finalMetas = metas;
-      if (exactMatchMeta) finalMetas = [exactMatchMeta, ...metas.filter((meta) => meta.id !== exactMatchMeta.id)];
-      if (finalMetas.length === 0) { const errorMeta = createErrorMeta('No Results Found', 'The AI could not find any recommendations for your query. Please try rephrasing your search.'); return { metas: [errorMeta] }; }
+      let finalMetas = exactMatchMeta ? [exactMatchMeta, ...metas.filter((m) => m.id !== exactMatchMeta.id)] : metas;
+      if (finalMetas.length === 0) return { metas: [createErrorMeta('No Results Found', 'The AI could not find recommendations. Please try rephrasing.')] };
       if (finalMetas.length > 0 && isSearchRequest) incrementQueryCounter();
       return { metas: finalMetas };
+
     } catch (error) {
-      logger.error("Local LLM Error:", { error: error.message, stack: error.stack, query: searchQuery });
+      logger.error("LLM Error:", { error: error.message, query: searchQuery });
       let errorMessage = 'The local LLM failed to respond. Check that your LLM server is running.';
-      if (error.message.includes('ECONNREFUSED') || error.message.includes('fetch')) errorMessage = `Could not connect to your LLM server at ${args.config?.LlmBaseUrl || DEFAULT_LLM_BASE_URL}. Is it running?`;
-      const errorMeta = createErrorMeta('LLM Error', errorMessage);
-      return { metas: [errorMeta] };
+      if (error.message.includes('ECONNREFUSED') || error.message.includes('fetch')) errorMessage = `Could not connect to LLM at ${args.config?.LlmBaseUrl || DEFAULT_LLM_BASE_URL}. Is it running?`;
+      return { metas: [createErrorMeta('LLM Error', errorMessage)] };
     }
   } catch (error) {
-    logger.error("Catalog processing error", { error: error.message, stack: error.stack });
-    const errorMeta = createErrorMeta('Addon Error', 'A critical error occurred. Please check the server logs.');
-    return { metas: [errorMeta] };
+    logger.error("Catalog error", { error: error.message });
+    return { metas: [createErrorMeta('Addon Error', 'A critical error occurred. Check server logs.')] };
   }
 };
 
@@ -1035,24 +992,22 @@ const streamHandler = async (args, req) => {
         const enableSimilar = configData.EnableSimilar !== undefined ? configData.EnableSimilar : true;
         if (!enableSimilar) return Promise.resolve({ streams: [] });
       }
-    } catch (error) { logger.error("Failed to read 'EnableSimilar' config in streamHandler", { error: error.message }); }
+    } catch (error) { logger.error("streamHandler config error", { error: error.message }); }
   }
   const isWeb = req.headers["origin"]?.includes("web.stremio.com");
   const stremioUrlPrefix = isWeb ? "https://web.stremio.com/#" : "stremio://";
-  const stream = { name: "✨ AI Search", description: "Similar movies and shows.", externalUrl: `${stremioUrlPrefix}/detail/${args.type}/ai-recs:${args.id}`, behaviorHints: { notWebReady: true } };
-  return Promise.resolve({ streams: [stream] });
+  return Promise.resolve({ streams: [{ name: "✨ AI Search", description: "Similar movies and shows.", externalUrl: `${stremioUrlPrefix}/detail/${args.type}/ai-recs:${args.id}`, behaviorHints: { notWebReady: true } }] });
 };
 
 const metaHandler = async function (args) {
   const { type, id, config } = args;
-  const startTime = Date.now();
   try {
     if (!id || !id.startsWith('ai-recs:')) return { meta: null };
     if (config) {
       const decryptedConfigStr = decryptConfig(config);
-      if (!decryptedConfigStr) throw new Error("Failed to decrypt config data in metaHandler");
+      if (!decryptedConfigStr) throw new Error("Failed to decrypt config");
       const configData = JSON.parse(decryptedConfigStr);
-      const { TmdbApiKey, GeminiModel, NumResults, RpdbApiKey, RpdbPosterType, TmdbLanguage, FanartApiKey } = configData;
+      const { TmdbApiKey, NumResults, RpdbApiKey, RpdbPosterType, TmdbLanguage, FanartApiKey } = configData;
       const llmBaseUrl = configData.LlmBaseUrl || DEFAULT_LLM_BASE_URL;
       const llmModel = configData.LlmModel || DEFAULT_LLM_MODEL;
       const llmApiKey = configData.LlmApiKey || DEFAULT_LLM_API_KEY;
@@ -1062,48 +1017,45 @@ const metaHandler = async function (args) {
       if (cached) return { meta: cached.data };
       let sourceDetails = await getTmdbDetailsByImdbId(originalId, type, TmdbApiKey);
       if (!sourceDetails) { const fallbackType = type === 'movie' ? 'series' : 'movie'; sourceDetails = await getTmdbDetailsByImdbId(originalId, fallbackType, TmdbApiKey); }
-      if (!sourceDetails) throw new Error(`Could not find source details for original ID: ${originalId}`);
+      if (!sourceDetails) throw new Error(`Could not find source for: ${originalId}`);
       const sourceTitle = sourceDetails.title || sourceDetails.name;
       const sourceYear = (sourceDetails.release_date || sourceDetails.first_air_date || "").substring(0, 4);
       let numResults = parseInt(NumResults) || 15;
       if (numResults > 25) numResults = 25;
-
-      const promptText = `You are an expert recommendation engine for movies and TV shows.
+      const promptText = `You are an expert recommendation engine.
 Generate exactly ${numResults} recommendations similar to "${sourceTitle} (${sourceYear})".
 
-PART 1: List all other official movies/series from the same franchise as "${sourceTitle}", sorted chronologically.
-PART 2: Fill remaining slots with highly similar unrelated titles, sorted by relevance.
+PART 1: All other official ${type === 'movie' ? 'movies' : 'series'} from the same franchise as "${sourceTitle}", chronologically.
+PART 2: Fill remaining slots with highly similar unrelated titles by relevance.
 
-CRITICAL: Do NOT include "${sourceTitle} (${sourceYear})" itself. No headers or explanations.
+Do NOT include "${sourceTitle} (${sourceYear})" itself.
+No headers or explanations.
 
-Format (one per line):
+Format:
 type|name|year
 
 Example:
-movie|Batman Begins|2005
-movie|The Dark Knight Rises|2012`;
-
+movie|Batman Begins|2005`;
       const responseText = await callLocalLLM(promptText, llmBaseUrl, llmModel, llmApiKey);
-      const lines = responseText.split('\n').map(line => line.trim()).filter(Boolean);
+      const lines = responseText.split('\n').map(l => l.trim()).filter(Boolean);
       const videoPromises = lines.map(async (line) => {
-        const parts = line.split('|');
-        if (parts.length !== 3) return null;
+        const parts = line.split('|'); if (parts.length !== 3) return null;
         const [recType, name, year] = parts.map(p => p.trim());
         const tmdbData = await searchTMDB(name, recType, year, TmdbApiKey);
         if (tmdbData && tmdbData.imdb_id) {
           let description = tmdbData.overview || "";
-          if (tmdbData.tmdbRating && tmdbData.tmdbRating > 0) description = `⭐ TMDB Rating: ${tmdbData.tmdbRating.toFixed(1)}/10\n\n${description}`;
+          if (tmdbData.tmdbRating && tmdbData.tmdbRating > 0) description = `⭐ TMDB: ${tmdbData.tmdbRating.toFixed(1)}/10\n\n${description}`;
           const landscapeThumbnail = await getLandscapeThumbnail(tmdbData, tmdbData.imdb_id, FanartApiKey, TmdbApiKey);
           return { id: tmdbData.imdb_id, title: tmdbData.title, released: new Date(tmdbData.release_date || '1970-01-01').toISOString(), overview: description, thumbnail: landscapeThumbnail };
         }
         return null;
       });
       const videos = (await Promise.all(videoPromises)).filter(Boolean);
-      const meta = { id: id, type: 'series', name: `AI: Recommendations for ${sourceTitle}`, description: `A collection of titles similar to ${sourceTitle} (${sourceYear}), generated by AI.`, poster: sourceDetails.poster_path ? `https://image.tmdb.org/t/p/w500${sourceDetails.poster_path}` : null, background: sourceDetails.backdrop_path ? `https://image.tmdb.org/t/p/original${sourceDetails.backdrop_path}` : null, videos: videos };
+      const meta = { id, type: 'series', name: `AI: Similar to ${sourceTitle}`, description: `Titles similar to ${sourceTitle} (${sourceYear}), generated by AI.`, poster: sourceDetails.poster_path ? `https://image.tmdb.org/t/p/w500${sourceDetails.poster_path}` : null, background: sourceDetails.backdrop_path ? `https://image.tmdb.org/t/p/original${sourceDetails.backdrop_path}` : null, videos };
       if (videos.length > 0) similarContentCache.set(cacheKey, { timestamp: Date.now(), data: meta });
       return { meta };
     }
-  } catch (error) { logger.error("Meta Handler Error:", { message: error.message, stack: error.stack, id: id }); }
+  } catch (error) { logger.error("Meta Handler Error:", { message: error.message, id }); }
   return { meta: null };
 };
 
@@ -1124,4 +1076,5 @@ module.exports = {
   incrementQueryCounter, getQueryCount, setQueryCount,
   removeTmdbDiscoverCacheItem, listTmdbDiscoverCacheKeys,
   getRpdbTierFromApiKey, searchTMDBExactMatch, determineIntentFromKeywords,
+  fetchRecentTmdbContent, isRecencyQuery, detectStreamingProvider,
 };
