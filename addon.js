@@ -33,7 +33,8 @@ async function callLocalLLM(prompt, baseUrl, model, apiKey) {
   const body = {
     model: model,
     messages: [{ role: "user", content: prompt }],
-    temperature: 0.7,
+    temperature: 0.3,
+    max_tokens: 300,
     stream: false,
   };
   const response = await withRetry(
@@ -46,7 +47,7 @@ async function callLocalLLM(prompt, baseUrl, model, apiKey) {
       if (!res.ok) { const err = new Error(`LLM API error: ${res.status}`); err.status = res.status; throw err; }
       return res.json();
     },
-    { maxRetries: 3, initialDelay: 2000, maxDelay: 10000, shouldRetry: (error) => !error.status || error.status >= 500, operationName: "Local LLM API call" }
+    { maxRetries: 1, initialDelay: 500, maxDelay: 2000, shouldRetry: (error) => !error.status || error.status >= 500, operationName: "Local LLM API call" }
   );
   const text = response?.choices?.[0]?.message?.content?.trim();
   if (!text) throw new Error("Empty response from local LLM");
@@ -574,9 +575,9 @@ const catalogHandler = async function (args, req) {
     if (!configData || Object.keys(configData).length === 0) return { metas: [createErrorMeta('Configuration Missing', 'Please configure the addon with your API keys.')] };
 
     const tmdbKey = configData.TmdbApiKey;
-    const llmBaseUrl = configData.LlmBaseUrl || DEFAULT_LLM_BASE_URL;
-    const llmModel = configData.LlmModel || DEFAULT_LLM_MODEL;
-    const llmApiKey = configData.LlmApiKey || DEFAULT_LLM_API_KEY;
+    const llmBaseUrl = DEFAULT_LLM_BASE_URL;
+    const llmModel = DEFAULT_LLM_MODEL;
+    const llmApiKey = DEFAULT_LLM_API_KEY;
 
     if (configData.traktConnectionError) return { metas: [createErrorMeta('Trakt Connection Failed', 'Your Trakt access has expired. Please log in again via the addon configuration page.')] };
     if (!tmdbKey || tmdbKey.length < 10) return { metas: [createErrorMeta('TMDB API Key Invalid', 'Your TMDB API key is missing or invalid.')] };
@@ -613,8 +614,8 @@ const catalogHandler = async function (args, req) {
     const language = configData.TmdbLanguage || "en-US";
     const rpdbKey = configData.RpdbApiKey || DEFAULT_RPDB_KEY;
     const rpdbPosterType = configData.RpdbPosterType || "poster-default";
-    let numResults = parseInt(configData.NumResults) || 20;
-    if (numResults > 30) numResults = MAX_AI_RECOMMENDATIONS;
+    let numResults = parseInt(configData.NumResults) || 5;
+    if (numResults > 10) numResults = 10;
     const enableAiCache = configData.EnableAiCache !== undefined ? configData.EnableAiCache : true;
     const includeAdult = configData.IncludeAdult === true;
     const platform = detectPlatform(extra);
@@ -679,68 +680,94 @@ const catalogHandler = async function (args, req) {
       }
     }
 
+    // === TMDB DIRECT ROUTING (before LLM) ===
+    const tmdbRouter = await (async () => {
+      const q = searchQuery.toLowerCase().trim();
+      const yearMatch = searchQuery.match(/\b(19\d{2}|20\d{2})\b/);
+      const currentYear = new Date().getFullYear();
+
+      // Genre ID map for TMDB
+      const genreMap = { action:28, comedy:35, drama:18, horror:27, thriller:53, romance:10749, "sci-fi":878, scifi:878, "science fiction":878, fantasy:14, documentary:99, animation:16, adventure:12, crime:80, mystery:9648, family:10751, history:36, music:10402, war:10752, western:37 };
+
+      const getGenreId = () => { for (const [k,v] of Object.entries(genreMap)) { if (q.includes(k)) return v; } return null; };
+
+      // Trending/popular
+      if (/\b(trending|most popular|what.s popular|popular right now)\b/.test(q)) {
+        const url = `https://api.themoviedb.org/3/trending/${type}/week?api_key=${tmdbKey}`;
+        const r = await fetch(url).then(x=>x.json());
+        return r.results?.slice(0, numResults) || null;
+      }
+      // Top rated
+      if (/\b(top rated|best of all time|highest rated|greatest|all time best)\b/.test(q)) {
+        const genreId = getGenreId();
+        const url = genreId
+          ? `https://api.themoviedb.org/3/discover/${type}?api_key=${tmdbKey}&with_genres=${genreId}&sort_by=vote_average.desc&vote_count.gte=500&language=${language}`
+          : `https://api.themoviedb.org/3/${type}/top_rated?api_key=${tmdbKey}&language=${language}`;
+        const r = await fetch(url).then(x=>x.json());
+        return r.results?.slice(0, numResults) || null;
+      }
+      // New/recent releases
+      if (/\b(new releases?|now playing|just released|latest releases?|coming soon|upcoming)\b/.test(q)) {
+        let url;
+        if (type === 'movie') {
+          url = `https://api.themoviedb.org/3/movie/now_playing?api_key=${tmdbKey}&language=${language}`;
+        } else {
+          const sinceDate = new Date(Date.now() - 180 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+          const today = new Date().toISOString().split('T')[0];
+          url = `https://api.themoviedb.org/3/discover/tv?api_key=${tmdbKey}&first_air_date.gte=${sinceDate}&first_air_date.lte=${today}&sort_by=popularity.desc&language=${language}`;
+        }
+        const r = await fetch(url).then(x=>x.json());
+        return r.results?.slice(0, numResults) || null;
+      }
+      // Year-specific queries
+      if (yearMatch) {
+        const year = yearMatch[1];
+        const genreId = getGenreId();
+        const yearParam = type === 'movie' ? 'primary_release_year' : 'first_air_date_year';
+        const url = `https://api.themoviedb.org/3/discover/${type}?api_key=${tmdbKey}&${yearParam}=${year}&sort_by=popularity.desc${genreId?`&with_genres=${genreId}`:''}`;
+        const r = await fetch(url).then(x=>x.json());
+        return r.results?.slice(0, numResults) || null;
+      }
+      // Pure genre + popular (no year, no mood)
+      if (/^(action|comedy|horror|thriller|drama|romance|sci-?fi|fantasy|documentary|animation|adventure|crime|mystery|family|western|war)\s*(movies?|films?|series|shows?)?\s*$/.test(q)) {
+        const genreId = getGenreId();
+        if (genreId) {
+          const url = `https://api.themoviedb.org/3/discover/${type}?api_key=${tmdbKey}&with_genres=${genreId}&sort_by=popularity.desc&language=${language}`;
+          const r = await fetch(url).then(x=>x.json());
+          return r.results?.slice(0, numResults) || null;
+        }
+      }
+      return null; // fall through to LLM
+    })();
+
+    if (tmdbRouter && tmdbRouter.length > 0) {
+      logger.info("TMDB direct routing", { query: searchQuery, results: tmdbRouter.length });
+      const items = tmdbRouter.map(r => ({
+        name: r.title || r.name,
+        year: parseInt((r.release_date || r.first_air_date || '0').substring(0, 4)),
+        type,
+        id: `tmdb_direct_${r.id}`
+      }));
+      const metas = (await Promise.all(items.map(item => toStremioMeta(item, platform, tmdbKey, rpdbKey, rpdbPosterType, language, configData, includeAdult)))).filter(Boolean);
+      if (metas.length > 0) {
+        if (isSearchRequest) incrementQueryCounter();
+        return { metas: exactMatchMeta ? [exactMatchMeta, ...metas.filter(m => m.id !== exactMatchMeta?.id)] : metas };
+      }
+    }
+    // === END TMDB DIRECT ROUTING ===
     try {
       const currentYear = new Date().getFullYear();
       let franchiseInstruction = `your TOP PRIORITY is to list ALL official mainline movies from that franchise, followed by spin-offs.`;
       if (type === 'series') franchiseInstruction = `your TOP PRIORITY is to provide ALL television content in that franchise including series, documentaries, and specials.`;
 
-      let promptLines = [`You are a ${type} recommendation expert. Analyze this query: "${searchQuery}"`, "", "QUERY ANALYSIS:"];
-      if (isRecommendation && discoveredGenres.length > 0) promptLines.push(`Discovered genres: ${discoveredGenres.join(", ")}`);
-      else if (genreCriteria?.include?.length > 0) promptLines.push(`Requested genres: ${genreCriteria.include.join(", ")}`);
-      if (genreCriteria?.mood?.length > 0) promptLines.push(`Mood/Style: ${genreCriteria.mood.join(", ")}`);
-      promptLines.push("");
+      const promptText = `List ${numResults} ${type === 'movie' ? 'movies' : 'TV series'} for this request: "${searchQuery}". If the request mentions a specific year or time period, only include titles released in that year or period.
+${type === 'movie' ? 'movie' : 'series'}|Title|Year
 
-      if (traktData && isRecommendation) {
-        const { preferences } = traktData;
-        const { recentlyWatched, highlyRated, lowRated } = filteredTraktData || { recentlyWatched: traktData.watched?.slice(0, 100) || [], highlyRated: (traktData.rated || []).filter((i) => i.rating >= 4).slice(0, 25), lowRated: (traktData.rated || []).filter((i) => i.rating <= 2).slice(0, 25) };
-        promptLines.push("USER WATCH HISTORY & PREFERENCES:", "");
-        if (recentlyWatched.length > 0) promptLines.push("Recently watched:", recentlyWatched.slice(0, 25).map((i) => { const m = i.movie || i.show; return `- ${m.title} (${m.year}) - ${m.genres?.join(", ") || "N/A"}`; }).join("\n"), "");
-        if (highlyRated.length > 0) promptLines.push("Highly rated (4-5 stars):", highlyRated.slice(0, 25).map((i) => { const m = i.movie || i.show; return `- ${m.title} (${i.rating}/5) - ${m.genres?.join(", ") || "N/A"}`; }).join("\n"), "");
-        if (lowRated.length > 0) promptLines.push("Low rated (1-2 stars):", lowRated.slice(0, 15).map((i) => { const m = i.movie || i.show; return `- ${m.title} (${i.rating}/5)`; }).join("\n"), "");
-        promptLines.push("Top genres:", preferences.genres.map((g) => `- ${g.genre}`).join("\n"), "", "Favorite actors:", preferences.actors.map((a) => `- ${a.actor}`).join("\n"), "");
-      }
+Example:
+${type === 'movie' ? 'movie|The Dark Knight|2008' : 'series|Breaking Bad|2008'}
 
-      if (tmdbInitialResults.length > 0) {
-        const initialTitles = tmdbInitialResults.slice(0, 15).map(item => `- ${item.title || item.name} (${(item.release_date || item.first_air_date || 'N/A').substring(0, 4)})`).join('\n');
-        promptLines.push("CONTEXT FROM DATABASE SEARCH:", "Use as primary data, add similar titles, sort by relevance:", "", initialTitles, "");
-      }
-
-      const examplesText = type === 'movie' ? "EXAMPLES:\nmovie|The Matrix|1999\nmovie|Inception|2010" : "EXAMPLES:\nseries|Breaking Bad|2008\nseries|Game of Thrones|2011";
-      promptLines = promptLines.concat([
-        "IMPORTANT INSTRUCTIONS:",
-        `- Current year is ${currentYear}.`,
-        `- 'recent' = last 2-3 years (${currentYear - 2} to ${currentYear})`,
-        `- 'new'/'latest' = released in ${currentYear}`,
-        "QUERY HANDLING:",
-        `1. FRANCHISE: ${franchiseInstruction}`,
-        `2. ACTOR/DIRECTOR: List notable works chronologically.`,
-        `3. GENERAL: Diverse recommendations matching theme/genre, ordered by relevance.`,
-        "CRITICAL REQUIREMENTS:",
-      ]);
-      if (traktData) promptLines.push(`- DO NOT recommend content from the user's watch history above.`, `- Recommend SIMILAR content to highly rated items but NOT the same ones.`);
-      promptLines = promptLines.concat([
-        `- Return up to ${numResults} ${type} recommendations.`,
-        `- Prioritize quality over exact matching.`,
-        "",
-        "RESPONSE FORMAT (no extra commentary):",
-        "[type]|[name]|[year]",
-        "",
-        examplesText,
-        "",
-        "RULES:",
-        "- Use | separator",
-        "- Year: YYYY format",
-        `- Type: label each as 'movie' or 'series'`,
-        "- Clean official titles only",
-        "- Only officially released content",
-      ]);
-      if (genreCriteria) {
-        if (genreCriteria.include.length > 0) promptLines.push(`- Must match genres: ${genreCriteria.include.join(", ")}`);
-        if (genreCriteria.exclude.length > 0) promptLines.push(`- Exclude genres: ${genreCriteria.exclude.join(", ")}`);
-        if (genreCriteria.mood.length > 0) promptLines.push(`- Match mood/style: ${genreCriteria.mood.join(", ")}`);
-      }
-
-      const promptText = promptLines.join("\n");
+Start immediately with ${type === 'movie' ? 'movie' : 'series'}|`;
+      logger.info("Calling local LLM", { model: llmModel, baseUrl: llmBaseUrl, query: searchQuery, type });
       logger.info("Calling local LLM", { model: llmModel, baseUrl: llmBaseUrl, query: searchQuery, type });
 
       const text = await callLocalLLM(promptText, llmBaseUrl, llmModel, llmApiKey);
@@ -826,9 +853,9 @@ const metaHandler = async function (args) {
       if (!decryptedConfigStr) throw new Error("Failed to decrypt config");
       const configData = JSON.parse(decryptedConfigStr);
       const { TmdbApiKey, NumResults, RpdbApiKey, RpdbPosterType, TmdbLanguage, FanartApiKey } = configData;
-      const llmBaseUrl = configData.LlmBaseUrl || DEFAULT_LLM_BASE_URL;
-      const llmModel = configData.LlmModel || DEFAULT_LLM_MODEL;
-      const llmApiKey = configData.LlmApiKey || DEFAULT_LLM_API_KEY;
+      const llmBaseUrl = DEFAULT_LLM_BASE_URL;
+      const llmModel = DEFAULT_LLM_MODEL;
+      const llmApiKey = DEFAULT_LLM_API_KEY;
       const originalId = id.split(':')[1];
       const cacheKey = `similar_${originalId}_${type}_${NumResults || 15}`;
       const cached = similarContentCache.get(cacheKey);
@@ -838,7 +865,7 @@ const metaHandler = async function (args) {
       if (!sourceDetails) throw new Error(`Could not find source for: ${originalId}`);
       const sourceTitle = sourceDetails.title || sourceDetails.name;
       const sourceYear = (sourceDetails.release_date || sourceDetails.first_air_date || "").substring(0, 4);
-      let numResults = parseInt(NumResults) || 15;
+      let numResults = parseInt(NumResults) || 8;
       if (numResults > 25) numResults = 25;
       const promptText = `You are an expert recommendation engine.
 Generate exactly ${numResults} recommendations similar to "${sourceTitle} (${sourceYear})".
