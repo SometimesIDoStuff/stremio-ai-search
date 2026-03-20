@@ -664,12 +664,15 @@ const catalogHandler = async function (args, req) {
       }
     }
 
-    const cacheKey = `${searchQuery}_${type}_${traktData ? "trakt" : "no_trakt"}`;
+    const _cacheQueryNorm = searchQuery.toLowerCase().trim().replace(/\s+/g, ' ');
+    const _cacheQueryHash = require('crypto').createHash('sha1').update(_cacheQueryNorm).digest('hex').slice(0, 16);
+    const cacheKey = `${_cacheQueryHash}_${type}_${traktData ? "trakt" : "no_trakt"}`;
     if (enableAiCache && !traktData && !isHomepageQuery && aiRecommendationsCache.has(cacheKey)) {
       const cached = aiRecommendationsCache.get(cacheKey);
       if (cached.configNumResults && numResults > cached.configNumResults) { aiRecommendationsCache.delete(cacheKey); }
       else if (!cached.data?.recommendations || (type === "movie" && !cached.data.recommendations.movies) || (type === "series" && !cached.data.recommendations.series)) { aiRecommendationsCache.delete(cacheKey); }
       else {
+        logger.info("LLM cache hit", { key: cacheKey, query: searchQuery });
         const selectedRecommendations = type === "movie" ? cached.data.recommendations.movies || [] : cached.data.recommendations.series || [];
         if (selectedRecommendations.length === 0) return { metas: [createErrorMeta('No Results Found', 'The AI could not find any recommendations.')] };
         const metas = (await Promise.all(selectedRecommendations.map((item) => toStremioMeta(item, platform, tmdbKey, rpdbKey, rpdbPosterType, language, configData, includeAdult)))).filter(Boolean);
@@ -683,6 +686,7 @@ const catalogHandler = async function (args, req) {
     // === TMDB DIRECT ROUTING (before LLM) ===
     const tmdbRouter = await (async () => {
       const q = searchQuery.toLowerCase().trim();
+      const tmdbType = type === 'series' ? 'tv' : type;
       const yearMatch = searchQuery.match(/\b(19\d{2}|20\d{2})\b/);
       const currentYear = new Date().getFullYear();
 
@@ -693,7 +697,7 @@ const catalogHandler = async function (args, req) {
 
       // Trending/popular
       if (/\b(trending|most popular|what.s popular|popular right now)\b/.test(q)) {
-        const url = `https://api.themoviedb.org/3/trending/${type}/week?api_key=${tmdbKey}`;
+        const url = `https://api.themoviedb.org/3/trending/${tmdbType}/week?api_key=${tmdbKey}`;
         const r = await fetch(url).then(x=>x.json());
         return r.results?.slice(0, numResults) || null;
       }
@@ -701,8 +705,8 @@ const catalogHandler = async function (args, req) {
       if (/\b(top rated|best of all time|highest rated|greatest|all time best)\b/.test(q)) {
         const genreId = getGenreId();
         const url = genreId
-          ? `https://api.themoviedb.org/3/discover/${type}?api_key=${tmdbKey}&with_genres=${genreId}&sort_by=vote_average.desc&vote_count.gte=500&language=${language}`
-          : `https://api.themoviedb.org/3/${type}/top_rated?api_key=${tmdbKey}&language=${language}`;
+          ? `https://api.themoviedb.org/3/discover/${tmdbType}?api_key=${tmdbKey}&with_genres=${genreId}&sort_by=vote_average.desc&vote_count.gte=500&language=${language}`
+          : `https://api.themoviedb.org/3/${tmdbType}/top_rated?api_key=${tmdbKey}&language=${language}`;
         const r = await fetch(url).then(x=>x.json());
         return r.results?.slice(0, numResults) || null;
       }
@@ -724,19 +728,196 @@ const catalogHandler = async function (args, req) {
         const year = yearMatch[1];
         const genreId = getGenreId();
         const yearParam = type === 'movie' ? 'primary_release_year' : 'first_air_date_year';
-        const url = `https://api.themoviedb.org/3/discover/${type}?api_key=${tmdbKey}&${yearParam}=${year}&sort_by=popularity.desc${genreId?`&with_genres=${genreId}`:''}`;
+        const url = `https://api.themoviedb.org/3/discover/${tmdbType}?api_key=${tmdbKey}&${yearParam}=${year}&sort_by=popularity.desc${genreId?`&with_genres=${genreId}`:''}`;
         const r = await fetch(url).then(x=>x.json());
         return r.results?.slice(0, numResults) || null;
+      }
+      // Decade queries e.g. '80s horror movies', 'films from the 90s'
+      const decadeMatch = q.match(/\b(\d0)s\b|\b(19|20)(\d0)s?\b|\b(sixties|seventies|eighties|nineties)\b/);
+      const decadeWordMap = { sixties:'1960', seventies:'1970', eighties:'1980', nineties:'1990' };
+      if (decadeMatch) {
+        let decadeStart;
+        if (decadeMatch[4]) decadeStart = decadeWordMap[decadeMatch[4]];
+        else if (decadeMatch[2]) decadeStart = decadeMatch[2] + decadeMatch[3];
+        else decadeStart = (parseInt(decadeMatch[1]) < 30 ? '20' : '19') + decadeMatch[1];
+        const decadeEnd = String(parseInt(decadeStart) + 9);
+        const genreId = getGenreId();
+        const dateGte = decadeStart + '-01-01';
+        const dateLte = decadeEnd + '-12-31';
+        const dateGteParam = type === 'movie' ? 'primary_release_date.gte' : 'first_air_date.gte';
+        const dateLteParam = type === 'movie' ? 'primary_release_date.lte' : 'first_air_date.lte';
+        const url = `https://api.themoviedb.org/3/discover/${tmdbType}?api_key=${tmdbKey}&${dateGteParam}=${dateGte}&${dateLteParam}=${dateLte}&sort_by=popularity.desc${genreId ? `&with_genres=${genreId}` : ''}&language=${language}`;
+        const r = await fetch(url).then(x=>x.json());
+        if (r.results?.length) return r.results.slice(0, numResults);
+      }
+      // Actor/director queries e.g. 'movies with Tom Hanks', 'directed by Nolan'
+      const actorMatch = q.match(/\b(?:with|starring|featuring)\s+([a-z]+(?:\s+[a-z]+)?)/);
+      const directorMatch = q.match(/\b(?:directed by|director)\s+([a-z]+(?:\s+[a-z]+)?)/);
+      const personName = directorMatch?.[1] || actorMatch?.[1];
+      if (personName) {
+        try {
+          const searchUrl = `https://api.themoviedb.org/3/search/person?api_key=${tmdbKey}&query=${encodeURIComponent(personName)}&language=${language}`;
+          const personData = await fetch(searchUrl).then(x=>x.json());
+          const person = personData.results?.[0];
+          if (person) {
+            const genreId = getGenreId();
+            const roleParam = directorMatch ? '&with_crew=' : '&with_cast=';
+            const url = `https://api.themoviedb.org/3/discover/${tmdbType}?api_key=${tmdbKey}${roleParam}${person.id}&sort_by=popularity.desc${genreId ? `&with_genres=${genreId}` : ''}&language=${language}`;
+            const r = await fetch(url).then(x=>x.json());
+            if (r.results?.length) return r.results.slice(0, numResults);
+          }
+        } catch(e) { /* fall through to LLM */ }
       }
       // Pure genre + popular (no year, no mood)
       if (/^(action|comedy|horror|thriller|drama|romance|sci-?fi|fantasy|documentary|animation|adventure|crime|mystery|family|western|war)\s*(movies?|films?|series|shows?)?\s*$/.test(q)) {
         const genreId = getGenreId();
         if (genreId) {
-          const url = `https://api.themoviedb.org/3/discover/${type}?api_key=${tmdbKey}&with_genres=${genreId}&sort_by=popularity.desc&language=${language}`;
+          const url = `https://api.themoviedb.org/3/discover/${tmdbType}?api_key=${tmdbKey}&with_genres=${genreId}&sort_by=popularity.desc&language=${language}`;
           const r = await fetch(url).then(x=>x.json());
           return r.results?.slice(0, numResults) || null;
         }
       }
+      // Language/country queries e.g. 'French movies', 'Korean thrillers', 'Japanese anime'
+      const langMap = {
+        french:'fr', spanish:'es', german:'de', italian:'it', japanese:'ja', korean:'ko',
+        chinese:'zh', portuguese:'pt', russian:'ru', hindi:'hi', arabic:'ar', swedish:'sv',
+        danish:'da', norwegian:'no', dutch:'nl', turkish:'tr', polish:'pl', thai:'th',
+        'latin american':'es', 'british':'en-GB'
+      };
+      const countryMap = {
+        french:'FR', spanish:'ES', german:'DE', italian:'IT', japanese:'JP', korean:'KR',
+        chinese:'CN', portuguese:'PT', russian:'RU', hindi:'IN', arabic:'SA', swedish:'SE',
+        danish:'DK', norwegian:'NO', dutch:'NL', turkish:'TR', polish:'PL', thai:'TH'
+      };
+      for (const [lang, code] of Object.entries(langMap)) {
+        if (q.includes(lang)) {
+          const genreId = getGenreId();
+          const url = `https://api.themoviedb.org/3/discover/${tmdbType}?api_key=${tmdbKey}&with_original_language=${code}&sort_by=popularity.desc${genreId ? `&with_genres=${genreId}` : ''}&language=${language}`;
+          const r = await fetch(url).then(x=>x.json());
+          if (r.results?.length) return r.results.slice(0, numResults);
+          break;
+        }
+      }
+
+      // Holiday/theme queries e.g. 'Christmas movies', 'Halloween films'
+      const holidayKeywords = {
+        christmas: 207317, halloween: 210024, thanksgiving: 207350,
+        'new year': 158431, easter: 207322, valentine: 9673,
+        superhero: 9715, zombie: 12377, vampire: 10063, witch: 11622,
+        'time travel': 10535, heist: 9882, survival: 10051, revenge: 10178,
+        spy: 10702, assassin: 10740, dystopia: 10761, apocalypse: 10840
+      };
+      for (const [theme, keywordId] of Object.entries(holidayKeywords)) {
+        if (q.includes(theme)) {
+          const genreId = getGenreId();
+          const url = `https://api.themoviedb.org/3/discover/${tmdbType}?api_key=${tmdbKey}&with_keywords=${keywordId}&sort_by=popularity.desc${genreId ? `&with_genres=${genreId}` : ''}&language=${language}`;
+          const r = await fetch(url).then(x=>x.json());
+          if (r.results?.length) return r.results.slice(0, numResults);
+          break;
+        }
+      }
+
+      // Award/quality queries e.g. 'Oscar winners', 'award winning', 'critically acclaimed'
+      if (/\b(oscar|academy award|golden globe|bafta|award.winning|critically acclaimed|prize.winning)\b/.test(q)) {
+        const genreId = getGenreId();
+        const voteMin = tmdbType === 'tv' ? 200 : 1000;
+        const url = `https://api.themoviedb.org/3/discover/${tmdbType}?api_key=${tmdbKey}&sort_by=vote_average.desc&vote_count.gte=${voteMin}${genreId ? `&with_genres=${genreId}` : ''}&language=${language}`;
+        const r = await fetch(url).then(x=>x.json());
+        if (r.results?.length) return r.results.slice(0, numResults);
+      }
+
+      // Hidden gems / underrated e.g. 'hidden gems', 'underrated movies', 'overlooked films'
+      if (/\b(hidden gem|underrated|overlooked|cult classic|under.the.radar|lesser.known)\b/.test(q)) {
+        const genreId = getGenreId();
+        const url = `https://api.themoviedb.org/3/discover/${tmdbType}?api_key=${tmdbKey}&sort_by=vote_average.desc&vote_count.gte=200&vote_count.lte=3000${genreId ? `&with_genres=${genreId}` : ''}&language=${language}`;
+        const r = await fetch(url).then(x=>x.json());
+        if (r.results?.length) return r.results.slice(0, numResults);
+      }
+
+      // Runtime queries e.g. 'short movies', 'quick films', 'long epic movies'
+      if (/\b(short film|short movie|quick watch|under 90|under 2 hour)\b/.test(q)) {
+        const genreId = getGenreId();
+        const url = `https://api.themoviedb.org/3/discover/movie?api_key=${tmdbKey}&with_runtime.lte=90&sort_by=popularity.desc${genreId ? `&with_genres=${genreId}` : ''}&language=${language}`;
+        const r = await fetch(url).then(x=>x.json());
+        if (r.results?.length) return r.results.slice(0, numResults);
+      }
+      if (/\b(long movie|long film|epic film|epic movie|over 3 hour|over 2.5 hour)\b/.test(q)) {
+        const genreId = getGenreId();
+        const url = `https://api.themoviedb.org/3/discover/movie?api_key=${tmdbKey}&with_runtime.gte=150&sort_by=popularity.desc${genreId ? `&with_genres=${genreId}` : ''}&language=${language}`;
+        const r = await fetch(url).then(x=>x.json());
+        if (r.results?.length) return r.results.slice(0, numResults);
+      }
+
+      // Kids/family safe e.g. 'kids movies', 'family friendly', 'children films', 'Disney'
+      if (/\b(kids?|children|family.friendly|disney|pixar|dreamworks|animated family)\b/.test(q)) {
+        const url = `https://api.themoviedb.org/3/discover/${tmdbType}?api_key=${tmdbKey}&with_genres=10751&certification_country=US&certification.lte=PG&sort_by=popularity.desc&language=${language}`;
+        const r = await fetch(url).then(x=>x.json());
+        if (r.results?.length) return r.results.slice(0, numResults);
+      }
+
+      // Recent by genre e.g. 'new action movies', 'latest horror', 'recent sci-fi'
+      if (/\b(new|latest|recent|just out|this year|past year)\b/.test(q) && getGenreId()) {
+        const genreId = getGenreId();
+        const sinceDate = new Date(Date.now() - 365 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+        const today = new Date().toISOString().split('T')[0];
+        const dateGteParam = type === 'movie' ? 'primary_release_date.gte' : 'first_air_date.gte';
+        const dateLteParam = type === 'movie' ? 'primary_release_date.lte' : 'first_air_date.lte';
+        const url = `https://api.themoviedb.org/3/discover/${tmdbType}?api_key=${tmdbKey}&${dateGteParam}=${sinceDate}&${dateLteParam}=${today}&with_genres=${genreId}&sort_by=popularity.desc&language=${language}`;
+        const r = await fetch(url).then(x=>x.json());
+        if (r.results?.length) return r.results.slice(0, numResults);
+      }
+
+      // Similar to X e.g. 'movies like Inception', 'similar to The Office'
+      const similarMatch = q.match(/\b(?:like|similar to|fans of|if you liked?)\s+(?:the\s+)?([a-z][a-z\s]{2,30}?)(?:\s*$|\s+(?:movie|film|show|series))/);
+      if (similarMatch) {
+        try {
+          const titleQuery = similarMatch[1].trim();
+          const searchUrl = `https://api.themoviedb.org/3/search/${tmdbType}?api_key=${tmdbKey}&query=${encodeURIComponent(titleQuery)}&language=${language}`;
+          const searchData = await fetch(searchUrl).then(x=>x.json());
+          const sourceTitle = searchData.results?.[0];
+          if (sourceTitle) {
+            const url = `https://api.themoviedb.org/3/${tmdbType}/${sourceTitle.id}/recommendations?api_key=${tmdbKey}&language=${language}`;
+            const r = await fetch(url).then(x=>x.json());
+            if (r.results?.length) return r.results.slice(0, numResults);
+          }
+        } catch(e) { /* fall through */ }
+      }
+
+      // Franchise/collection e.g. 'Marvel movies', 'Fast and Furious', 'James Bond films'
+      const franchiseMap = {
+        'marvel': 9485, 'mcu': 9485, 'avengers': 9485,
+        'dc comics': 10112, 'batman': 10112, 'superman': 10112,
+        'star wars': 10, 'james bond': 645, 'bond': 645,
+        'fast and furious': 9485, 'jurassic': 328, 'jurassic park': 328,
+        'harry potter': 1241, 'wizarding world': 1241,
+        'lord of the rings': 119, 'tolkien': 119,
+        'mission impossible': 87359, 'indiana jones': 84, 'john wick': 404609,
+        'matrix': 2344, 'terminator': 528, 'alien': 8091, 'predator': 9362,
+        'planet of the apes': 173710, 'transformers': 8650,
+        'x-men': 748, 'spider-man': 556, 'iron man': 131292,
+        'captain america': 131295, 'thor': 131296, 'guardians': 284433,
+        'pixar': 10194, 'toy story': 10194, 'disney': 2, 'dreamworks': 521
+      };
+      for (const [franchise, collectionId] of Object.entries(franchiseMap)) {
+        if (q.includes(franchise)) {
+          try {
+            const url = `https://api.themoviedb.org/3/collection/${collectionId}?api_key=${tmdbKey}&language=${language}`;
+            const r = await fetch(url).then(x=>x.json());
+            const parts = r.parts?.sort((a,b) => new Date(a.release_date||0) - new Date(b.release_date||0));
+            if (parts?.length) return parts.slice(0, numResults);
+          } catch(e) {
+            // fallback to keyword search
+            const url = `https://api.themoviedb.org/3/search/collection?api_key=${tmdbKey}&query=${encodeURIComponent(franchise)}&language=${language}`;
+            const r = await fetch(url).then(x=>x.json());
+            if (r.results?.[0]) {
+              const col = await fetch(`https://api.themoviedb.org/3/collection/${r.results[0].id}?api_key=${tmdbKey}`).then(x=>x.json());
+              if (col.parts?.length) return col.parts.slice(0, numResults);
+            }
+          }
+          break;
+        }
+      }
+
       return null; // fall through to LLM
     })();
 
@@ -750,6 +931,11 @@ const catalogHandler = async function (args, req) {
       }));
       const metas = (await Promise.all(items.map(item => toStremioMeta(item, platform, tmdbKey, rpdbKey, rpdbPosterType, language, configData, includeAdult)))).filter(Boolean);
       if (metas.length > 0) {
+        if (enableAiCache && !traktData) {
+          const tmdbRouterCacheData = { recommendations: type === "movie" ? { movies: items } : { series: items } };
+          aiRecommendationsCache.set(cacheKey, { timestamp: Date.now(), data: tmdbRouterCacheData, configNumResults: numResults });
+          logger.info("TMDB router cached", { key: cacheKey, query: searchQuery, count: metas.length });
+        }
         if (isSearchRequest) incrementQueryCounter();
         return { metas: exactMatchMeta ? [exactMatchMeta, ...metas.filter(m => m.id !== exactMatchMeta?.id)] : metas };
       }
@@ -767,7 +953,6 @@ Example:
 ${type === 'movie' ? 'movie|The Dark Knight|2008' : 'series|Breaking Bad|2008'}
 
 Start immediately with ${type === 'movie' ? 'movie' : 'series'}|`;
-      logger.info("Calling local LLM", { model: llmModel, baseUrl: llmBaseUrl, query: searchQuery, type });
       logger.info("Calling local LLM", { model: llmModel, baseUrl: llmBaseUrl, query: searchQuery, type });
 
       const text = await callLocalLLM(promptText, llmBaseUrl, llmModel, llmApiKey);

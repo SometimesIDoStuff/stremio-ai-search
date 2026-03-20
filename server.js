@@ -295,7 +295,7 @@ if (ENABLE_LOGGING) {
   logger.info("Logging enabled via ENABLE_LOGGING environment variable");
 }
 
-const PORT = 7000;
+const PORT = process.env.PORT || 7001;
 const HOST = process.env.HOST
   ? `https://${process.env.HOST}`
   : "https://stremio.itcon.au";
@@ -1376,7 +1376,6 @@ async function startServer() {
       });
     });
 
-    app.use("/", addonRouter);
     app.use(BASE_PATH, addonRouter);
 
     app.post(["/encrypt", "/aisearch/encrypt"], express.json(), async (req, res) => {
@@ -1513,27 +1512,22 @@ app.post(["/validate", "/aisearch/validate"], express.json(), async (req, res) =
 
     const validations = [];
 
-    // Gemini Validation
-    if (GeminiApiKey) {
-      validations.push((async () => {
-        try {
-          const { GoogleGenerativeAI } = require("@google/generative-ai");
-          const genAI = new GoogleGenerativeAI(GeminiApiKey);
-          const model = genAI.getGenerativeModel({ model: modelToUse });
-          const result = await model.generateContent("Test prompt");
-          const responseText = result.response.text();
-          if (responseText.length > 0) {
-            validationResults.gemini = true;
-          } else {
-            validationResults.errors.gemini = "Invalid Gemini API key - No response";
-          }
-        } catch (error) {
-          validationResults.errors.gemini = `Invalid Gemini API key: ${error.message}`;
+    // Local LLM Validation
+    validations.push((async () => {
+      try {
+        const llmUrl = process.env.LLM_BASE_URL || "http://localhost:11434/v1";
+        const llmResponse = await fetch(`${llmUrl}/models`, {
+          headers: { "Authorization": `Bearer ${process.env.LLM_API_KEY || "ollama"}` }
+        });
+        if (llmResponse.ok) {
+          validationResults.gemini = true;
+        } else {
+          validationResults.errors.gemini = `Local LLM unreachable (Status: ${llmResponse.status})`;
         }
-      })());
-    } else {
-       validationResults.errors.gemini = "Gemini API Key is required.";
-    }
+      } catch (error) {
+        validationResults.errors.gemini = `Local LLM connection failed: ${error.message}`;
+      }
+    })());
 
     // TMDB Validation
     if (TmdbApiKey) {
