@@ -656,12 +656,13 @@ async function startServer() {
             res.setHeader("Content-Type", "application/json");
 
             const searchParam = req.params.extra?.split("search=")[1];
-            const searchQuery = searchParam ? decodeURIComponent(searchParam) : req.query.search || "";
+            const searchQuery = searchParam ? decodeURIComponent(searchParam.split("&")[0].split("%26")[0]) : req.query.search || "";
+            const skipVal = parseInt(req.query.skip || (req.params.extra?.includes("skip=") ? req.params.extra.split("skip=")[1]?.split("&")[0] : "0") || "0") || 0;
 
             const args = {
               type: req.params.type,
               id: req.params.id,
-              extra: { search: searchQuery },
+              extra: { search: searchQuery, skip: skipVal },
               config: decryptedConfig,
             };
 
