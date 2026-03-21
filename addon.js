@@ -712,13 +712,13 @@ const catalogHandler = async function (args, req) {
     const rpdbKey = configData.RpdbApiKey || DEFAULT_RPDB_KEY;
     const rpdbPosterType = configData.RpdbPosterType || "poster-default";
     let numResults = parseInt(configData.NumResults) || 20;
-    if (numResults > 50) numResults = 50;
+    if (numResults > 200) numResults = 200;
     const tmdbNumResults = Math.max(numResults, 20);
 
     // Multi-page TMDB fetch — always fetch at least 2 pages (max 3 pages = 60 results)
     const fetchTmdbPages = async (baseUrl) => {
       const pagesNeeded = Math.ceil(numResults / 20);
-      const pagesToFetch = Math.min(Math.max(pagesNeeded, 2), 3);
+      const pagesToFetch = Math.min(Math.max(pagesNeeded, 2), 10);
       const isAnimeQuery = /\b(anime|manga|japanese|japan)\b/i.test(searchQuery);
       const sep = baseUrl.includes('?') ? '&' : '?';
       const animeExclusion = !isAnimeQuery && !baseUrl.includes('without_genres') ? '&without_keywords=210024&without_genres=16&without_original_language=ja' : '';
@@ -751,6 +751,7 @@ const catalogHandler = async function (args, req) {
     // Strip common suffixes to get candidate name: "ryan reynolds movies" -> "ryan reynolds"
     const _nameCandidate = searchQuery.trim()
       .replace(/\b(movies|films|series|shows|tv shows|filmography|directed by|starring|featuring|with|movies with|films with|works of|best|top|all|complete)\b/gi, '')
+      .replace(/\b(action|adventure|comedy|drama|horror|thriller|fantasy|mystery|romance|sci.?fi|science fiction|animation|documentary|crime|western|musical|war|history|family|sport|anime)s?\b/gi, '')
       .trim();
     // Use TMDB person search to check if candidate resolves to a real person
     const _checkIsPerson = async (candidate) => {
@@ -1265,7 +1266,8 @@ const catalogHandler = async function (args, req) {
         try {
           const pd = await fetch(`https://api.themoviedb.org/3/search/person?api_key=${tmdbKey}&query=${encodeURIComponent(candidate)}&language=${language}`).then(x=>x.json());
           const p = pd.results?.[0];
-          if (p && p.popularity > 5) { personFound = p; break; } // popularity>5 = real known person
+          const _gw = /^(action|adventure|comedy|drama|horror|thriller|fantasy|mystery|romance|sci.?fi|science fiction|animation|documentary|crime|western|musical|war|history|family|sport|anime)s?$/i;
+          if (p && p.popularity > 10 && !_gw.test(candidate.trim())) { personFound = p; break; } // popularity>10 = real known person
         } catch(e) {}
       }
       const personName = personFound?.name;
